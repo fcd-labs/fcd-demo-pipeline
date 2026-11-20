@@ -6,4 +6,15 @@ Het bash-script `fcd` is de enige weg om te bouwen, te testen, te controleren, u
 
 Meer over deze showcase: https://fcd-labs.github.io/fcd/showcases/demo/
 
+## Gebruik
+
+```bash
+./fcd check                 # wat mist er?
+./fcd ci ../sk-demo         # CI-stappen en gates, lokaal (omgeving werkplek)
+./fcd hooks ../sk-demo      # dezelfde stappen vóór elke push
+./fcd up                    # start de Pipeline-agent: haalt main op, bouwt, rolt uit, releaset
+```
+
+Elke repository heeft `versions.env` (de versies) en `ci/steps.sh` (wat specifiek is voor die repository). Tools en hun licentie: [tools.env](tools.env).
+
 Licentie: [MIT](LICENSE).
