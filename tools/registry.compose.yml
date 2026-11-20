@@ -1,0 +1,16 @@
+# API-register of a showcase: Apicurio Registry (Apache-2.0), a tool of FCD without own code.
+# Started by `fcd up` as project <prefix>-registry; the port comes from the configuration (Environment.ports.registry).
+# Storage in memory (H2) for the demo: afwijking EXP-003. The contracts are in git; the Pipeline fills the register again.
+services:
+  registry:
+    image: ${TOOL_APICURIO:?run via fcd (tools.env)}
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT_REGISTRY:?run via fcd (environment of the showcase)}:8080"
