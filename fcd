@@ -516,8 +516,10 @@ start_run() { # repo env
 
 trigger_of_head() {
   if [ -n "${FCD_TRIGGER_KIND:-}" ]; then R_TRIGGER_KIND=$FCD_TRIGGER_KIND; R_TRIGGER_NAME=${FCD_TRIGGER_NAME:-unknown}; return; fi
+  # The trigger is who made HEAD: for a merge on main that is the person who merged (a human),
+  # for a commit before a push it can be an AI agent (Co-Authored-By) or an automatic update.
   local author msg
-  author=$(git -C "$R_REPO" log -1 --format=%an HEAD); msg=$(git -C "$R_REPO" log -1 --format=%B HEAD^2 2>/dev/null || git -C "$R_REPO" log -1 --format=%B HEAD)
+  author=$(git -C "$R_REPO" log -1 --format=%an HEAD); msg=$(git -C "$R_REPO" log -1 --format=%B HEAD)
   if [ "$R_ENV" = werkplek ]; then R_TRIGGER_NAME=$(git -C "$R_REPO" config user.name || whoami)
   else R_TRIGGER_NAME=$author; fi
   R_TRIGGER_KIND=human
@@ -577,7 +579,7 @@ human_gate() { # human gate: a merge on main with a higher sub-product version
   local tag old; tag=$(last_tag "$R_REPO"); old=${tag#v}
   if [ -z "$tag" ] || ver_gt "$R_VERSION" "$old"; then
     R_RELEASE=1
-    emit "dev.cdeventsx.fcd-qualitygate.evaluated.0.1.0" "human-gate" "$(printf '{"gate":"human","afterSteps":"9","outcome":"open","reason":%s,"explain":""}' "$(json_str "goedgekeurd door $R_TRIGGER_NAME: merge op main met versie $R_VERSION${tag:+ (was $old)}")")"
+    emit "dev.cdeventsx.fcd-qualitygate.evaluated.0.1.0" "human-gate" "$(printf '{"gate":"human","afterSteps":"9","outcome":"open","reason":%s,"explain":""}' "$(json_str "goedgekeurd door $(git -C "$R_REPO" log -1 --format=%an HEAD): merge op main met versie $R_VERSION${tag:+ (was $old)}")")"
     ok "${C_B}human-gate open${C_0}: merge op main, versie $R_VERSION"
   else
     info "geen nieuwe versie ($R_VERSION = $tag): niet releasen"
@@ -632,6 +634,10 @@ agent_once() {
     head=$(git -C "$work" rev-parse origin/main)
     last=$(cat "$state" 2>/dev/null || true)
     [ "$head" = "$last" ] && continue
+    if ! git -C "$work" cat-file -e "$head:versions.env" 2>/dev/null; then
+      [ "$last" = "no-config:$head" ] || say "$(now_iso) $r: nog geen versions.env op main, overgeslagen"
+      echo "no-config:$head" >"$state"; continue
+    fi
     say "$(now_iso) $r: nieuw op main $head"
     git -C "$work" checkout -q --detach "$head" && git -C "$work" clean -qfdx -e .fcd
     if "$FCD_SELF" ci "$work" --env lokaal; then say "$(now_iso) $r: gelukt"; else say "$(now_iso) $r: gestopt (gate dicht of fout)"; fi
