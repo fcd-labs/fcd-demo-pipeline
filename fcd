@@ -387,7 +387,7 @@ report_tests() { # kind dir max_failed: sum all JUnit XML, emit testsuiterun.fin
   emit "dev.cdevents.testsuiterun.finished.0.2.0" "$kind" \
     "$(printf '{"testSuite":{"id":%s,"name":%s},"testType":%s,"outcome":%s,"tests":%s,"passed":%s,"failed":%s,"skipped":%s,"seconds":%s,"failures":%s,"reportDir":%s}' \
       "$(json_str "$R_NAME-$kind")" "$(json_str "$kind")" "$(json_str "$kind")" "$(json_str "$outcome")" \
-      "$tests" "$(( tests - failed - skipped ))" "$failed" "$skipped" "$time" "$(json_str "$failures")" "$(json_str "$dir")")" "$time"
+      "$tests" "$(( tests - failed - skipped ))" "$failed" "$skipped" "$time" "$(json_str "$failures")" "$(json_str "${dir#"$R_REPO"/}")")" "$time"
   echo "$kind: $tests tests, $failed failed, $skipped skipped (${time}s)"
   if [ "$tests" -eq 0 ] || [ "$failed" -gt "$max" ]; then s_fail "$kind: $failed van $tests tests mislukt${failures:+ ($failures)}"; fi
 }
@@ -709,7 +709,7 @@ trigger_of_head() {
 
 finish_run() { # outcome reason
   local dur=$(( $(now_s) - R_T0 ))
-  emit "dev.cdevents.pipelinerun.finished.0.2.0" "$R_ID" "$(printf '{"pipelineName":%s,"outcome":%s,"errors":%s,"warnings":%s,"url":%s}' "$(json_str "$R_NAME")" "$(json_str "$1")" "$(json_str "${2:-}")" "$(json_str "$R_WARNINGS")" "$(json_str "$R_DIR")")" "$dur"
+  emit "dev.cdevents.pipelinerun.finished.0.2.0" "$R_ID" "$(printf '{"pipelineName":%s,"outcome":%s,"errors":%s,"warnings":%s,"url":%s}' "$(json_str "$R_NAME")" "$(json_str "$1")" "$(json_str "${2:-}")" "$(json_str "$R_WARNINGS")" "$(json_str "${R_DIR#"$R_REPO"/}")")" "$dur"
   say ""; say "run $R_ID: $1 (${dur}s)"; info "log lines: $R_DIR/events.jsonl"
 }
 

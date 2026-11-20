@@ -21,6 +21,7 @@ Alle wijzigingen per versie. Formaat: [Keep a Changelog](https://keepachangelog.
 
 ### Opgelost
 - Een tijdelijke testomgeving in een run na een merge meldde zich als `lokaal`; de bestellingen van de integratietests telden dan mee voor het key result. Nu altijd `werkplek`.
+- Logregels bevatten geen lokale paden meer (rapporten en run relatief aan de repository): de log staat openbaar in de showcase-repository.
 - Releasen naar een git-host die geen GitHub is: alleen de tag (elke git-host werkt), geen fout.
 - Scans: een bevinding (exitcode 3) en een mislukte scan (zoals een geblokkeerde download) hebben elk een eigen reden; beide houden de gate dicht.
 
