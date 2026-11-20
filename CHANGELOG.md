@@ -4,6 +4,11 @@ Alle wijzigingen per versie. Formaat: [Keep a Changelog](https://keepachangelog.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-20 - Noodpatch
+
+### Opgelost
+- `fcd up`, `down` en `status` kozen de compose-projecten op voorvoegsel (`demo-`) en raakten zo ook een ander project met dezelfde naam aan (`fcd up` startte het). Nu alleen de exacte projecten van de showcase: `<prefix>-dashboard` en `<prefix>-<deelproduct>`.
+
 ## [0.4.0] - 2026-11-20
 
 ### Gewijzigd

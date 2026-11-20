@@ -896,6 +896,12 @@ cmd_agent() {
   while true; do agent_once "$sc" || true; flush_outbox >/dev/null 2>&1 || true; sleep "$FCD_AGENT_INTERVAL"; done
 }
 
+showcase_projects() { # the exact compose projects of the showcase (never a prefix match: other projects may share it)
+  printf '%s\n' "$SC_PREFIX-dashboard"
+  local sp; for sp in $(cfg_names SubProduct); do printf '%s\n' "$SC_PREFIX-$sp"; done
+}
+project_exists() { docker compose -p "$1" ps -a -q 2>/dev/null | grep -q .; }
+
 agent_running() { [ -f "$SC_HOME/agent.pid" ] && kill -0 "$(cat "$SC_HOME/agent.pid")" 2>/dev/null; }
 
 cmd_up() { # one command per showcase: its Dashboard and its Pipeline agent, with its configuration and versions
@@ -904,8 +910,8 @@ cmd_up() { # one command per showcase: its Dashboard and its Pipeline agent, wit
   showcase_load "$sc" "$(mktemp)"
   say "${C_B}fcd up${C_0} showcase $SC_NAME: Pipeline $(pipeline_version), Dashboard $(dashboard_version)"
   dashboard_up
-  local p; for p in $(docker compose ls -a --format json 2>/dev/null | tr ',' '\n' | sed -n 's/.*"Name":"\([^"]*\)".*/\1/p' | grep "^$SC_PREFIX-" | grep -v -- "-dashboard$" | grep -v -- "-ci-"); do
-    docker compose -p "$p" start >/dev/null 2>&1 && ok "$p gestart"
+  local p; for p in $(showcase_projects | grep -vx "$SC_PREFIX-dashboard"); do
+    project_exists "$p" && docker compose -p "$p" start >/dev/null 2>&1 && ok "$p gestart"
   done
   if agent_running; then ok "Pipeline-agent draait al"
   else
@@ -922,8 +928,8 @@ cmd_down() {
   local sc=""; [ "${1:-}" = --showcase ] && sc=$2
   showcase_load "$(cd "$(showcase_dir_arg "$sc")" && pwd)" "$(mktemp)"
   if [ -f "$SC_HOME/agent.pid" ]; then kill "$(cat "$SC_HOME/agent.pid")" 2>/dev/null || true; rm -f "$SC_HOME/agent.pid"; ok "Pipeline-agent gestopt"; fi
-  local p; for p in $(docker compose ls --format json 2>/dev/null | tr ',' '\n' | sed -n 's/.*"Name":"\([^"]*\)".*/\1/p' | grep "^$SC_PREFIX-"); do
-    docker compose -p "$p" stop >/dev/null 2>&1 && ok "$p gestopt"
+  local p; for p in $(showcase_projects); do
+    project_exists "$p" && docker compose -p "$p" stop >/dev/null 2>&1 && ok "$p gestopt"
   done
 }
 
@@ -931,7 +937,9 @@ cmd_status() {
   local sc=""; [ "${1:-}" = --showcase ] && sc=$2
   showcase_load "$(cd "$(showcase_dir_arg "$sc")" && pwd)" "$(mktemp)"
   if agent_running; then ok "Pipeline-agent draait (showcase $SC_NAME)"; else bad "Pipeline-agent draait niet (fcd up)"; fi
-  docker ps --filter "label=com.docker.compose.project" --format '{{.Label "com.docker.compose.project"}}\t{{.Names}}\t{{.Image}}\t{{.Status}}' | grep "^$SC_PREFIX-" || true
+  local p; for p in $(showcase_projects); do
+    docker ps --filter "label=com.docker.compose.project=$p" --format '{{.Label "com.docker.compose.project"}}\t{{.Names}}\t{{.Image}}\t{{.Status}}'
+  done
 }
 
 cmd_logs() {
