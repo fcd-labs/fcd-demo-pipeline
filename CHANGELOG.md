@@ -4,6 +4,11 @@ Alle wijzigingen per versie. Formaat: [Keep a Changelog](https://keepachangelog.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-20
+
+### Opgelost
+- `fcd bump` haalt eerst de release-tags op. Zonder die tags vergeleek hij met een oudere release en verhoogde hij de versie van het deelproduct niet (de codegate ving het).
+
 ## [0.3.1] - 2026-11-20 - Noodpatch
 
 ### Opgelost

@@ -624,6 +624,8 @@ cmd_bump() {
   [ $# -eq 3 ] && { repo=$1; shift; }
   what=${1:?container of subproduct}; part=${2:?major, minor of patch}
   repo=$(cd "$repo" && pwd)
+  # Compare with the latest release, also when it was made by the Pipeline after the last fetch.
+  git -C "$repo" fetch -q --tags origin 2>/dev/null || true
   local var cur new
   if [ "$what" = subproduct ]; then var=SUBPRODUCT_VERSION; else var=$(container_var "$what"); fi
   cur=$(ver_get "$repo" "$var"); [ -n "$cur" ] || die "$var niet gevonden in versions.env"
