@@ -94,7 +94,9 @@ showcase_for_repo() { # repo dir -> showcase repository dir: the fcd-* next to i
     [ -d "$d" ] || continue
     # Only a SubProduct makes a repository part of the showcase (a Contract may name another repository).
     grep -qE "repository:[[:space:]]*${name}[[:space:]]*$" "$d"/*.fcd.yaml 2>/dev/null || continue
-    if docker run --rm -v "$d":/cfg:ro "$TOOL_YQ" ea 'select(.kind == "SubProduct") | .spec.repository' /cfg/*.fcd.yaml 2>/dev/null | grep -qx "$name"; then
+    local sc_files=() f
+    for f in "$d"/*.fcd.yaml; do sc_files+=("/cfg/$(basename "$f")"); done
+    if docker run --rm -v "$d":/cfg:ro "$TOOL_YQ" ea 'select(.kind == "SubProduct") | .spec.repository' "${sc_files[@]}" 2>/dev/null | grep -qx "$name"; then
       dirname "$d"; return
     fi
   done
