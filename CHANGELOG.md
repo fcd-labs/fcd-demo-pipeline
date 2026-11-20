@@ -4,6 +4,14 @@ Alle wijzigingen per versie. Formaat: [Keep a Changelog](https://keepachangelog.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-11-20
+
+### Toegevoegd
+- `fcd experiment start <naam>`: een nieuw experiment met een lege log; de vorige log blijft bewaard en is te kiezen in het Dashboard. De agent haalt alles opnieuw door de pipeline, zodat de containers in het nieuwe experiment meten.
+
+### Opgelost
+- `fcd bump` vergelijkt met `main` in plaats van met de laatste release-tag. Een gemergde, nog niet getagde versie werd anders niet als "al uitgebracht" gezien, en dan bleef de versie van het deelproduct staan.
+
 ## [0.3.2] - 2026-11-20
 
 ### Opgelost
