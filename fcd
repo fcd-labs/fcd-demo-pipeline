@@ -343,7 +343,7 @@ unit_from_dockerfile() { # name context [dockerfile] [build-arg...]: export targ
 
 step_3() { # contract test: lint OpenAPI + no unnoticed breaking change
   [ -n "${CI_OPENAPI:-}" ] || { s_skip "geen OpenAPI-contract in deze repository"; return 0; }
-  local spec tag old base_major new_major
+  local spec tag base_major new_major
   for spec in $CI_OPENAPI; do
     echo "== lint $spec"
     docker run --rm -v "$R_REPO":/spec:ro -w /spec "$TOOL_REDOCLY" lint "$spec" || s_fail "contract $spec: lint-fouten"
@@ -351,11 +351,14 @@ step_3() { # contract test: lint OpenAPI + no unnoticed breaking change
   tag=$(last_tag "$R_REPO")
   if [ -z "$tag" ]; then echo "no previous release: no breaking-change check"; return 0; fi
   base_major=${tag#v}; base_major=${base_major%%.*}; new_major=${R_VERSION%%.*}
+  # The whole repository as it was at the previous release, so references between files ($ref) resolve.
+  local base="$R_DIR/contract-base"
+  rm -rf "$base"; mkdir -p "$base"
+  git -C "$R_REPO" archive "$tag" | tar -x -C "$base"
   for spec in $CI_OPENAPI; do
-    old="$R_DIR/contract-base-$(basename "$spec")"
-    git -C "$R_REPO" show "$tag:$spec" >"$old" 2>/dev/null || { echo "$spec is new since $tag"; continue; }
+    [ -f "$base/$spec" ] || { echo "$spec is new since $tag"; continue; }
     echo "== breaking changes $spec since $tag"
-    if ! docker run --rm -v "$R_REPO":/new:ro -v "$R_DIR":/base:ro "$TOOL_OASDIFF" breaking "/base/$(basename "$old")" "/new/$spec" --fail-on ERR; then
+    if ! docker run --rm -v "$R_REPO":/new:ro -v "$base":/base:ro "$TOOL_OASDIFF" breaking "/base/$spec" "/new/$spec" --fail-on ERR; then
       if [ "$new_major" -gt "$base_major" ]; then echo "breaking change with a new major version: allowed"
       else s_fail "contract $spec: breaking change zonder nieuwe major-versie"; fi
     fi
@@ -518,6 +521,8 @@ start_run() { # repo env
   [ -f "$R_REPO/versions.env" ] || die "$R_REPO: geen versions.env"
   R_NAME=$(basename "$(git -C "$R_REPO" remote get-url origin 2>/dev/null || echo "$R_REPO")" .git)
   R_PRODUCT=$(ver_get "$R_REPO" PRODUCT); R_SUBPRODUCT=$(ver_get "$R_REPO" SUBPRODUCT); R_VERSION=$(ver_get "$R_REPO" SUBPRODUCT_VERSION)
+  # Release tags are needed for the version and contract checks, also before a push.
+  git -C "$R_REPO" fetch -q --tags origin 2>/dev/null || true
   R_SHA=$(git -C "$R_REPO" rev-parse --short HEAD)
   # Commit time for the lead time: the merged commit (second parent of a merge), else HEAD.
   local ts; ts=$(git -C "$R_REPO" log -1 --format=%at HEAD^2 2>/dev/null || git -C "$R_REPO" log -1 --format=%at HEAD)

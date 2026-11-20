@@ -4,6 +4,12 @@ Alle wijzigingen per versie. Formaat: [Keep a Changelog](https://keepachangelog.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-20 - Noodpatch
+
+### Opgelost
+- Contracttest (stap 3): van de vorige release werd alleen het losse contractbestand opgehaald, waardoor verwijzingen naar andere bestanden (`$ref`) niet werkten en de codegate onterecht dichtviel. Nu wordt de hele repository van de vorige release uitgepakt.
+- Ook vóór een push worden de release-tags opgehaald, zodat de versie- en contractcontrole lokaal hetzelfde ziet als de Pipeline.
+
 ## [0.3.0] - 2026-11-20
 
 ### Toegevoegd
