@@ -1,35 +1,35 @@
 #!/usr/bin/env bash
-# fcd: the only way to build, test, check, deploy and release (deelproduct Pipeline of fcd-demo).
+# fcd: the only way to build, test, check, deploy and release. Deelproduct Pipeline of the product FCD.
+# One Pipeline for all showcases: what differs per showcase is in its configuration (the declarative
+# files fcd-<showcase>/fcd/*.fcd.yaml), never in this script.
 #
-#   fcd check                      what is missing before anything goes wrong
-#   fcd ci [repo] [options]        CI steps 1-10 with the quality gates, for one repository
-#       --env werkplek|lokaal      werkplek (default): before a push, nothing is deployed for real
-#                                  lokaal: after a merge on main (the agent); deploys and releases
+#   fcd check [--showcase dir]           what is missing before anything goes wrong
+#   fcd ci [repo] [options]              the CI steps and quality gates of the showcase, for one repository
+#       --env werkplek|lokaal            werkplek (default): before a push; lokaal: after a merge on main (agent)
+#       --showcase dir                   the showcase repository (default: found next to the repository)
 #   fcd bump [repo] <container|subproduct> <major|minor|patch>
-#   fcd hooks [repo]               install the pre-push hook (same steps and gates before a push)
-#   fcd agent [--once]             the Pipeline: fetch main (GitOps), run ci, deploy, release
-#   fcd up | down | status | logs  start or stop the Pipeline agent and the deployed sub-products
-#   fcd report                     save the status report of the Dashboard in fcd-demo/reports
-#   fcd experiment [start <name>]  show the experiment, or start a new one with an empty log
+#   fcd hooks [repo]                     install the pre-push hook (same steps and gates before a push)
+#   fcd up [--showcase dir]              start the showcase: Dashboard and Pipeline agent of the pinned versions
+#   fcd down | status | logs [--showcase dir]
+#   fcd agent --showcase dir [--once]    the Pipeline: fetch main (GitOps), run ci, deploy, release
+#   fcd report [--showcase dir]          save the status report and the log in the showcase repository
+#   fcd experiment [start <name>] [--showcase dir]
 #   fcd version
 #
 # Works with bash 3.2 (macOS) and any docker runtime with `docker` and `docker compose`.
-# Every step and gate sends a log line (CDEvents, contract in fcd-demo/contracts) to the Dashboard.
+# Every step and gate sends a log line (CDEvents, contract in fcd-dashboard/contracts) to the Dashboard
+# of the showcase.
 set -euo pipefail
 
 FCD_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 FCD_PIPELINE_DIR="${FCD_PIPELINE_DIR:-$(dirname "$FCD_SELF")}"
 FCD_HOME="${FCD_HOME:-$HOME/.fcd}"
-FCD_DASHBOARD_URL="${FCD_DASHBOARD_URL:-http://127.0.0.1:8070/api/v1/events}"
-FCD_SHOWCASE="${FCD_SHOWCASE:-demo}"
-FCD_EXPERIMENT="${FCD_EXPERIMENT:-}"
 FCD_ORG_URL="${FCD_ORG_URL:-https://github.com/fcd-labs}"
-FCD_AGENT_REPOS="${FCD_AGENT_REPOS:-fcd-demo-pipeline fcd-demo-dashboard sk-demo}"
 FCD_AGENT_INTERVAL="${FCD_AGENT_INTERVAL:-30}"
+FCD_ROOT="$(dirname "$FCD_PIPELINE_DIR")"   # the folder with all repositories next to each other
 
 # shellcheck source=tools.env
 . "$FCD_PIPELINE_DIR/tools.env"
-# shellcheck source=versions.env
 FCD_VERSION="$(sed -n 's/^SUBPRODUCT_VERSION=//p' "$FCD_PIPELINE_DIR/versions.env")"
 
 # ---------------------------------------------------------------- output
@@ -56,10 +56,79 @@ uuid() {
   else uuidgen | tr '[:upper:]' '[:lower:]'; fi
 }
 
+# ---------------------------------------------------------------- configuration of the showcase
+
+# The declarative files of the showcase, flattened to lines "Kind/name/path=value" (one yq call).
+CFG=""
+cfg_load() { # showcase repository dir -> $CFG (a file)
+  local dir=$1 out=$2
+  ls "$dir"/fcd/*.fcd.yaml >/dev/null 2>&1 || die "$dir: geen declaratieve bestanden (fcd/*.fcd.yaml)"
+  docker run --rm -v "$dir/fcd":/cfg:ro "$TOOL_YQ" ea \
+    '. as $d | $d | .. | select(tag != "!!map" and tag != "!!seq") | ($d.kind + "/" + $d.metadata.name + "/" + (path | join("/"))) + "=" + (. | tostring)' \
+    /cfg/*.fcd.yaml >"$out"
+  CFG=$out
+}
+cfg() { # kind name path [default]
+  local v; v=$(awk -v k="$1/$2/$3=" 'index($0, k) == 1 { print substr($0, length(k) + 1); exit }' "$CFG")
+  printf '%s' "${v:-${4:-}}"
+}
+cfg_list() { # kind name path -> the items of a list, one per line, in order
+  awk -v k="$1/$2/$3/" 'index($0, k) == 1 { r = substr($0, length(k) + 1); i = index(r, "="); n = substr(r, 1, i - 1)
+    if (n ~ /^[0-9]+$/) print n "\t" substr(r, i + 1) }' "$CFG" | sort -n | cut -f2-
+}
+cfg_keys() { # kind name path -> the keys of a map, one per line
+  awk -v k="$1/$2/$3/" 'index($0, k) == 1 { r = substr($0, length(k) + 1); split(r, p, "[/=]"); if (!seen[p[1]]++) print p[1] }' "$CFG"
+}
+cfg_names() { # kind -> the names of all objects of that kind
+  awk -F/ -v k="$1" '$1 == k && !seen[$2]++ { print $2 }' "$CFG"
+}
+cfg_first() { cfg_names "$1" | head -1; }
+
+# The showcase: its repository (with fcd/*.fcd.yaml) and where its data lives on this machine.
+SC_REPO=""; SC_NAME=""; SC_HOME=""; SC_PREFIX=""
+showcase_for_repo() { # repo dir -> showcase repository dir: the fcd-* next to it whose configuration names this repository
+  local name=$1 d
+  for d in "$FCD_ROOT"/fcd-*/fcd "$(dirname "$2")"/fcd-*/fcd; do
+    [ -d "$d" ] || continue
+    if grep -qE "^[[:space:]]*repository:[[:space:]]*${name}[[:space:]]*$" "$d"/*.fcd.yaml 2>/dev/null; then dirname "$d"; return; fi
+  done
+}
+showcase_load() { # showcase repository dir, a place for the flattened config
+  SC_REPO=$(cd "$1" && pwd)
+  cfg_load "$SC_REPO" "$2"
+  local factory; factory=$(cfg_first Factory)
+  SC_NAME=$(cfg Factory "$factory" spec/showcase)
+  [ -n "$SC_NAME" ] || die "$SC_REPO: Factory zonder spec.showcase"
+  # D1 (interim): FCD's own sub-products use the configuration of a showcase until it is in fcd; their data is
+  # kept apart as showcase "fcd". Issue in fcd: the configuration of FCD itself.
+  [ -n "${FCD_SHOWCASE_OVERRIDE:-}" ] && SC_NAME=$FCD_SHOWCASE_OVERRIDE
+  SC_HOME="$FCD_HOME/$SC_NAME"; mkdir -p "$SC_HOME"
+  local env; env=$(cfg_first Environment)
+  SC_PREFIX=$(cfg Environment "$env" spec/composeProjectPrefix "$SC_NAME")
+  [ -n "${FCD_SHOWCASE_OVERRIDE:-}" ] && SC_PREFIX=$SC_NAME
+  # Ports of the environment, for the compose files: PORT_DASHBOARD, PORT_BESTELLEN, ...
+  local k v
+  for k in $(cfg_keys Environment "$env" spec/ports); do
+    v=$(cfg Environment "$env" "spec/ports/$k")
+    export "PORT_$(printf '%s' "$k" | tr '[:lower:]-' '[:upper:]_')=$v"
+  done
+  if [ -n "${FCD_SHOWCASE_OVERRIDE:-}" ]; then export PORT_DASHBOARD="${FCD_PORT_DASHBOARD:-8370}"; fi
+  FCD_DASHBOARD_URL="${FCD_DASHBOARD_URL:-http://127.0.0.1:${PORT_DASHBOARD:-0}/api/v1/events}"
+  export DASHBOARD_EVENTS_URL="http://host.docker.internal:${PORT_DASHBOARD:-0}/api/v1/events"
+  export FCD_SHOWCASE="$SC_NAME"
+}
+showcase_dir_arg() { # [--showcase dir] -> a showcase repository: the given one, the current dir, or fcd-demo next to the Pipeline
+  if [ -n "${1:-}" ]; then printf '%s' "$1"
+  elif ls ./fcd/*.fcd.yaml >/dev/null 2>&1; then pwd
+  else printf '%s' "$FCD_ROOT/fcd-demo"; fi
+}
+experiment_of() { cat "$SC_HOME/experiment" 2>/dev/null || cfg Factory "$(cfg_first Factory)" spec/experiment mvp0; }
+
 # ---------------------------------------------------------------- check
 
 cmd_check() {
-  local missing=0
+  local sc="" missing=0
+  [ "${1:-}" = --showcase ] && sc=$2
   say "${C_B}fcd check${C_0} (Pipeline $FCD_VERSION)"
   if command -v git >/dev/null; then ok "git $(git --version | awk '{print $3}')"; else bad "git ontbreekt: installeer git"; missing=1; fi
   ok "bash $BASH_VERSION"
@@ -68,18 +137,23 @@ cmd_check() {
     if docker info >/dev/null 2>&1; then ok "docker werkt"; else bad "docker is er, maar draait niet: start je container-runtime"; missing=1; fi
     if docker compose version >/dev/null 2>&1; then ok "docker compose $(docker compose version --short 2>/dev/null)"; else bad "docker compose ontbreekt (compose v2)"; missing=1; fi
   else bad "docker ontbreekt: installeer een container-runtime met docker en docker compose"; missing=1; fi
-  local root; root="$(dirname "$FCD_PIPELINE_DIR")"
+  [ "$missing" -eq 0 ] || { bad "er mist iets (zie hierboven)"; return 1; }
+  local dir; dir=$(showcase_dir_arg "$sc")
+  [ -d "$dir/.git" ] || { bad "showcase-repository $dir ontbreekt"; return 1; }
+  showcase_load "$dir" "$(mktemp)"
+  ok "showcase $SC_NAME ($SC_REPO)"
   local r
-  for r in fcd fcd-demo fcd-demo-pipeline fcd-demo-dashboard sk-demo; do
-    if [ -d "$root/$r/.git" ]; then ok "repository $r"
-    else bad "repository $r ontbreekt: git clone $FCD_ORG_URL/$r.git \"$root/$r\""; missing=1; fi
+  for r in fcd fcd-pipeline fcd-dashboard $(cfg_names SubProduct | while read -r s; do cfg SubProduct "$s" spec/repository; done | sort -u); do
+    if [ -d "$FCD_ROOT/$r/.git" ]; then ok "repository $r"
+    else bad "repository $r ontbreekt: git clone $FCD_ORG_URL/$r.git \"$FCD_ROOT/$r\""; missing=1; fi
   done
-  local p
-  for p in 8070 8080 8091 8092 8093; do
+  local k p env; env=$(cfg_first Environment)
+  for k in $(cfg_keys Environment "$env" spec/ports); do
+    p=$(cfg Environment "$env" "spec/ports/$k")
     if (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then
-      if docker ps --format '{{.Ports}}' 2>/dev/null | grep -q "127.0.0.1:$p->"; then ok "poort $p (in gebruik door een container)"
-      else bad "poort $p is bezet door een ander programma"; missing=1; fi
-    else ok "poort $p vrij"; fi
+      if docker ps --format '{{.Ports}}' 2>/dev/null | grep -q "127.0.0.1:$p->"; then ok "poort $p ($k, in gebruik door een container)"
+      else bad "poort $p ($k) is bezet door een ander programma"; missing=1; fi
+    else ok "poort $p ($k) vrij"; fi
   done
   if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then ok "gh (optioneel, voor de GitHub Release)"
   else info "- gh ontbreekt of is niet ingelogd (optioneel): releasen wordt overgeslagen"; fi
@@ -115,23 +189,22 @@ changelog_section() { # text of a version section (without the heading)
 emit() { # type subject_id subject_content_json [duration_seconds]
   local type=$1 sid=$2 content=$3 dur=${4:-0}
   local ev
-  ev=$(printf '{"context":{"version":"0.4.1","id":"%s","source":"fcd-demo-pipeline/%s","type":"%s","timestamp":"%s"},"subject":{"id":%s,"source":"%s","content":%s},"customData":%s}' \
+  ev=$(printf '{"context":{"version":"0.4.1","id":"%s","source":"fcd-pipeline/%s","type":"%s","timestamp":"%s"},"subject":{"id":%s,"source":"%s","content":%s},"customData":%s}' \
     "$(uuid)" "$FCD_VERSION" "$type" "$(now_iso)" "$(json_str "$sid")" "$R_NAME" "$content" "$(custom_data "$dur")")
   printf '%s\n' "$ev" >>"$R_DIR/events.jsonl"
   send_event "$ev"
 }
 
-send_event() {
-  mkdir -p "$FCD_HOME"
+send_event() { # to the Dashboard of the showcase; without a Dashboard into the outbox of the showcase
   if curl -fsS -m 3 -H 'Content-Type: application/json' -d "$1" "$FCD_DASHBOARD_URL" >/dev/null 2>&1; then
     flush_outbox
   else
-    printf '%s\n' "$1" >>"$FCD_HOME/outbox.jsonl"
+    printf '%s\n' "$1" >>"$SC_HOME/outbox.jsonl"
   fi
 }
 
 flush_outbox() {
-  local f="$FCD_HOME/outbox.jsonl" line
+  local f="$SC_HOME/outbox.jsonl" line
   [ -s "$f" ] || return 0
   mv "$f" "$f.sending"
   while IFS= read -r line; do
@@ -152,13 +225,13 @@ custom_data() {
     "$1" "$(json_str "$R_ID")" "$(json_str "$R_SHA")" "$(json_str "$R_COMMIT_TIME")" \
     "$(json_str "$R_TRIGGER_KIND")" "$(json_str "$R_TRIGGER_NAME")" "$(json_str "$R_PRODUCT")" \
     "$(json_str "$R_SUBPRODUCT")" "$(json_str "$R_VERSION")" "$containers" \
-    "$(json_str "$FCD_SHOWCASE")" "$(json_str "$R_EXPERIMENT")" "$(json_str "$R_ENV")" "$(json_str "$R_RELEASE_TYPE")"
+    "$(json_str "$SC_NAME")" "$(json_str "$R_EXPERIMENT")" "$(json_str "$R_ENV")" "$(json_str "$R_RELEASE_TYPE")"
 }
 
-fcd_secret() { # name: a generated secret for this machine, never in git (~/.fcd/secrets, mode 600)
-  local f="$FCD_HOME/secrets/$1"
+fcd_secret() { # name: a generated secret per showcase on this machine, never in git (mode 600)
+  local f="$SC_HOME/secrets/$1"
   if [ ! -s "$f" ]; then
-    mkdir -p "$FCD_HOME/secrets"; chmod 700 "$FCD_HOME/secrets"
+    mkdir -p "$SC_HOME/secrets"; chmod 700 "$SC_HOME/secrets"
     (umask 077; LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32 >"$f")
   fi
   cat "$f"
@@ -166,30 +239,30 @@ fcd_secret() { # name: a generated secret for this machine, never in git (~/.fcd
 
 container_var() { printf '%s_VERSION' "$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')"; }
 
-# ---------------------------------------------------------------- steps
-
-STEP_NAMES=("" "static-check" "unit-tests" "contract-test" "build" "integration-tests" "security-freshness" "sbom-licenses" "deploy" "end-to-end-tests" "release")
-STEP_TITLES=("" "Statische controle" "Unittests" "Contracttest" "Bouwen" "Integratietests" "Security en versheid" "SBOM en licenties" "Deployen" "End-to-end tests" "Releasen")
+# ---------------------------------------------------------------- steps and gates (from the configuration)
 
 GATE_REASONS=""   # reasons collected by the steps for the next gate
 STEP_REASON=""    # reason of the current step (failed or skipped)
 STEP_SKIPPED=0
 
 gate_fail() { GATE_REASONS="${GATE_REASONS:+$GATE_REASONS; }$*"; STEP_REASON="${STEP_REASON:+$STEP_REASON; }$*"; }
-step_skip() { STEP_SKIPPED=1; STEP_REASON="$*"; }
 warn()      { R_WARNINGS="${R_WARNINGS:+$R_WARNINGS; }$*"; info "  waarschuwing: $*"; }
 
-run_step() { # number
-  local n=$1 name=${STEP_NAMES[$1]} title=${STEP_TITLES[$1]} t0 rc outcome dur
+threshold() { cfg QualityGate "$1" "spec/thresholds/$2" "${3:-}"; }   # gate path [default]
+
+run_step() { # number name
+  local n=$1 name=$2 title fn t0 rc outcome dur
+  title=$(cfg Step "$name" metadata/title "$name")
+  fn="step_$(printf '%s' "$name" | tr '-' '_')"
   local log="$R_DIR/step-$n-$name.log"
   STEP_REASON=""; STEP_SKIPPED=0
-  say "${C_B}[$n/10] $title${C_0}"
+  say "${C_B}[$n/$R_STEP_COUNT] $title${C_0}"
   emit "dev.cdevents.taskrun.started.0.2.0" "$name" "$(printf '{"taskName":%s,"step":%s,"title":%s,"pipelineRun":{"id":%s},"outcome":"running"}' "$(json_str "$name")" "$n" "$(json_str "$title")" "$(json_str "$R_ID")")"
   t0=$(now_s)
   local before="$GATE_REASONS"
   set +e
-  ( set -e; "step_$n" ) >"$log" 2>&1 <&-
-  rc=$?
+  if has "$fn"; then ( set -e; "$fn" ) >"$log" 2>&1 <&-; rc=$?
+  else echo "step $name is not implemented in the Pipeline" >"$log"; rc=1; STEP_REASON="stap $name bestaat niet in de Pipeline (issue)"; fi
   set -e
   # state written by the subshell
   [ -f "$R_DIR/.step-state" ] && . "$R_DIR/.step-state" && rm -f "$R_DIR/.step-state"
@@ -211,7 +284,7 @@ s_skip() { step_state STEP_SKIPPED 1; step_state STEP_REASON "$*"; }
 s_warn() { step_state R_WARNINGS "${R_WARNINGS:+$R_WARNINGS; }$*"; R_WARNINGS="${R_WARNINGS:+$R_WARNINGS; }$*"; }
 has() { declare -F "$1" >/dev/null; }
 
-gate() { # name after_steps
+gate() { # name after_steps (as text for the log line)
   # An approved explain covers only the reasons that contain its rule; any other reason closes the gate.
   local name=$1 after=$2 outcome=open reason="" explains="" open_reasons="" r id nl=$'\n'
   if [ -n "$GATE_REASONS" ]; then
@@ -241,38 +314,34 @@ EOF_REASONS
   ok "${C_B}$name-gate open${C_0}${reason:+ ($reason)}"
 }
 
-explain_json() { # id -> {"id","gate","rule","reason","approver","until"} from explains.yaml
-  local field v out=""
-  for field in gate rule reason approver until; do
-    v=$(awk -v want="$1" -v f="$field" '
-      function val(line) { sub(/^[^:]*:[ ]*/, "", line); sub(/[ ]+#.*$/, "", line); gsub(/^"|"$/, "", line); return line }
-      /^- id:/ { cur = val($0) }
-      cur == want && $0 ~ "^  " f ":" { print val($0); exit }' "$R_REPO/explains.yaml")
-    out="$out,$(json_str "$field"):$(json_str "$v")"
-  done
+explain_json() { # id -> {"id","gate","rule","reason","approver","until"} from the configuration
+  local field out=""
+  for field in gate rule reason approver until; do out="$out,$(json_str "$field"):$(json_str "$(cfg Explanation "$1" "spec/$field")")"; done
   printf '{"id":%s%s}' "$(json_str "$1")" "$out"
 }
 
-explain_for() { # gate reason -> id of an approved, not expired explain whose rule is part of the reason
-  # explains.yaml entries: id, gate, rule, reason, approver, until (YYYY-MM-DD, inclusive)
-  local f="$R_REPO/explains.yaml"
-  [ -f "$f" ] || return 0
-  awk -v g="$1" -v why="$2" -v t="$(date -u +%Y-%m-%d)" '
-    function val(line) { sub(/^[^:]*:[ ]*/, "", line); sub(/[ ]+#.*$/, "", line); gsub(/^"|"$/, "", line); return line }
-    function check() { if (id != "" && gate == g && rule != "" && appr != "" && until >= t && index(why, rule) > 0) { print id; found = 1; exit } }
-    /^- id:/ { check(); id = val($0); gate = ""; rule = ""; appr = ""; until = "" }
-    /^  gate:/ { gate = val($0) }
-    /^  rule:/ { rule = val($0) }
-    /^  approver:/ { appr = val($0) }
-    /^  until:/ { until = val($0) }
-    END { if (!found) check() }' "$f"
+explain_for() { # gate reason -> id of an approved, not expired explain (configuration) whose rule is part of the reason
+  local id today; today=$(date -u +%Y-%m-%d)
+  for id in $(cfg_names Explanation); do
+    local g rule appr until subject
+    g=$(cfg Explanation "$id" spec/gate); rule=$(cfg Explanation "$id" spec/rule)
+    appr=$(cfg Explanation "$id" spec/approver); until=$(cfg Explanation "$id" spec/until); subject=$(cfg Explanation "$id" spec/subject)
+    [ "$g" = "$1" ] && [ -n "$rule" ] && [ -n "$appr" ] || continue
+    [ -z "$subject" ] || [ "$subject" = "$R_NAME" ] || continue
+    [ -z "$until" ] || [ ! "$until" \< "$today" ] || continue
+    case "$2" in *"$rule"*) printf '%s' "$id"; return ;; esac
+  done
 }
 
-# -- generic step implementations; a repository can override each with ci_<name> in ci/steps.sh
+# -- step implementations, keyed by the name of the Step in the configuration.
+# A repository says how its product is linted, tested and built in ci/steps.sh (ci_lint, ci_unit, ci_freshness, CI_*).
 
-step_1() { # static check: repository lint + version consistency
-  if has ci_lint; then ci_lint || s_fail "lint-fouten (zie log)"; else s_warn "geen lint ingesteld"; fi
-  check_versions
+step_static_check() { # lint + version consistency
+  if has ci_lint; then
+    ci_lint || [ "$(threshold code lintErrors/max 0)" != 0 ] || s_fail "lint-fouten (zie log)"
+  else s_warn "geen lint ingesteld"; fi
+  [ "$(threshold code versionsConsistent true)" = true ] && check_versions
+  return 0
 }
 
 check_versions() {
@@ -298,14 +367,14 @@ check_versions() {
   echo "versions consistent with $tag"
 }
 
-step_2() { # unit tests: reports as JUnit XML in reports/unit
+step_unit_tests() { # reports as JUnit XML in reports/unit
   has ci_unit || { s_skip "geen unittests ingesteld"; return 0; }
   ci_unit
-  report_tests unit "$R_DIR/reports/unit"
+  report_tests unit "$R_DIR/reports/unit" "$(threshold code unitTestsFailed/max 0)"
 }
 
-report_tests() { # kind dir: sum all JUnit XML, emit testsuiterun.finished, fail on failures
-  local kind=$1 dir=$2 counts tests failed skipped time failures outcome
+report_tests() { # kind dir max_failed: sum all JUnit XML, emit testsuiterun.finished, fail above the threshold
+  local kind=$1 dir=$2 max=${3:-0} counts tests failed skipped time failures outcome
   counts=$(junit_counts "$dir")
   read -r tests failed skipped time <<<"$counts"
   failures=$(junit_failures "$dir")
@@ -316,7 +385,7 @@ report_tests() { # kind dir: sum all JUnit XML, emit testsuiterun.finished, fail
       "$(json_str "$R_NAME-$kind")" "$(json_str "$kind")" "$(json_str "$kind")" "$(json_str "$outcome")" \
       "$tests" "$(( tests - failed - skipped ))" "$failed" "$skipped" "$time" "$(json_str "$failures")" "$(json_str "$dir")")" "$time"
   echo "$kind: $tests tests, $failed failed, $skipped skipped (${time}s)"
-  [ "$outcome" = pass ] || s_fail "$kind: $failed van $tests tests mislukt${failures:+ ($failures)}"
+  if [ "$tests" -eq 0 ] || [ "$failed" -gt "$max" ]; then s_fail "$kind: $failed van $tests tests mislukt${failures:+ ($failures)}"; fi
 }
 
 junit_counts() { # dir -> "tests failed skipped seconds" (from <testsuite> elements)
@@ -342,12 +411,12 @@ unit_from_dockerfile() { # name context [dockerfile] [build-arg...]: export targ
   docker build --target test-reports --output "type=local,dest=$R_DIR/reports/unit/$name" $args "$@" "$R_REPO/$ctx"
 }
 
-step_3() { # contract test: lint OpenAPI + no unnoticed breaking change
+step_contract_test() { # lint OpenAPI + no unnoticed breaking change
   [ -n "${CI_OPENAPI:-}" ] || { s_skip "geen OpenAPI-contract in deze repository"; return 0; }
   local spec tag base_major new_major
   for spec in $CI_OPENAPI; do
     echo "== lint $spec"
-    docker run --rm -v "$R_REPO":/spec:ro -w /spec "$TOOL_REDOCLY" lint "$spec" || s_fail "contract $spec: lint-fouten"
+    docker run --rm -v "$R_REPO":/spec:ro -w /spec "$TOOL_REDOCLY" lint "$spec" || [ "$(threshold code contractLintErrors/max 0)" != 0 ] || s_fail "contract $spec: lint-fouten"
   done
   tag=$(last_tag "$R_REPO")
   if [ -z "$tag" ]; then echo "no previous release: no breaking-change check"; return 0; fi
@@ -361,6 +430,7 @@ step_3() { # contract test: lint OpenAPI + no unnoticed breaking change
     echo "== breaking changes $spec since $tag"
     if ! docker run --rm -v "$R_REPO":/new:ro -v "$base":/base:ro "$TOOL_OASDIFF" breaking "/base/$spec" "/new/$spec" --fail-on ERR; then
       if [ "$new_major" -gt "$base_major" ]; then echo "breaking change with a new major version: allowed"
+      elif [ "$(threshold code breakingChanges/withoutNewMajor 0)" != 0 ]; then echo "breaking change allowed by the threshold"
       else s_fail "contract $spec: breaking change zonder nieuwe major-versie"; fi
     fi
   done
@@ -374,7 +444,7 @@ compose_r() { # docker compose for the repository, project $1
   docker compose -p "$p" --project-directory "$R_REPO" --env-file "$R_REPO/versions.env" $files "$@"
 }
 
-step_4() { # build all images, tags follow versions.env; fetch the images that are not built here
+step_build() { # build all images, tags follow versions.env; fetch the images that are not built here
   [ -n "${CI_COMPOSE_FILES:-}" ] || { s_skip "geen containers in deze repository"; return 0; }
   compose_r "$R_PROJECT" pull --ignore-buildable --quiet
   compose_r "$R_PROJECT" build
@@ -387,9 +457,9 @@ ephemeral_up() {
 }
 ephemeral_down() { [ -n "${CI_COMPOSE_FILES:-}" ] && compose_r "$R_EPHEMERAL" -f "$R_REPO/ci/compose.ephemeral.yml" down -v --remove-orphans >/dev/null 2>&1 || true; }
 
-wait_ready() { # project: probe CI_READY_URL inside the project network
-  local i
-  for i in $(seq 1 60); do
+wait_ready() { # project: probe CI_READY_URL inside the project network, within the threshold of the deploy gate
+  local i max; max=$(threshold deploy readySeconds/max 60)
+  for i in $(seq 1 "$max"); do
     if docker run --rm --network "${1}_default" "$TOOL_CURL" -fsS -o /dev/null "$CI_READY_URL" >/dev/null 2>&1; then echo "ready after ${i}s"; return 0; fi
     sleep 1
   done
@@ -397,82 +467,122 @@ wait_ready() { # project: probe CI_READY_URL inside the project network
   return 1
 }
 
-step_5() { # integration tests: the sub-product with stubs in a short-lived environment; contract checks
+step_integration_tests() { # the sub-product with stubs in a short-lived environment; contract checks
   [ -n "${CI_CONTRACT_TARGETS:-}" ] || { s_skip "geen integratietests ingesteld"; return 0; }
   ephemeral_up || { s_fail "tijdelijke omgeving start niet"; return 0; }
-  local t spec url name
+  local t spec url name checks examples
+  checks=$(cfg_list Step integration-tests spec/contractChecks | paste -sd, -)
+  examples=$(cfg Step integration-tests spec/maxExamples 25)
   mkdir -p "$R_DIR/reports/integration"
-  # shellcheck disable=SC2086
   for t in $CI_CONTRACT_TARGETS; do # name=spec@url
     name=${t%%=*}; spec=${t#*=}; spec=${spec%@*}; url=${t##*@}
-    echo "== schemathesis $name: $spec against $url"
+    echo "== schemathesis $name: $spec against $url (checks: ${checks:-all})"
     docker run --rm --network "${R_EPHEMERAL}_default" -v "$R_REPO":/spec:ro -v "$R_DIR/reports/integration":/reports \
-      "$TOOL_SCHEMATHESIS" run "/spec/$spec" --url "$url" ${CI_SCHEMATHESIS_ARGS:---checks all} --max-examples 25 --workers 1 \
+      "$TOOL_SCHEMATHESIS" run "/spec/$spec" --url "$url" --checks "${checks:-all}" --max-examples "$examples" --workers 1 \
       --report junit --report-junit-path "/reports/TEST-$name.xml" || true
   done
-  report_tests integration "$R_DIR/reports/integration"
+  report_tests integration "$R_DIR/reports/integration" "$(threshold build integrationTestsFailed/max 0)"
 }
 
 images() { compose_r "$R_PROJECT" config --images; }
 
-step_6() { # security and freshness
-  [ -n "${CI_COMPOSE_FILES:-}" ] || CI_SKIP_IMAGES=1
+step_security_freshness() { # vulnerabilities, secrets, configuration; freshness of libraries
   mkdir -p "$R_DIR/scan"
-  echo "== repository: vulnerabilities, secrets, configuration"
-  trivy_r fs --exit-code 1 --severity HIGH,CRITICAL --scanners vuln,secret,misconfig --offline-scan \
-    --skip-dirs /repo/.fcd --skip-dirs /repo/bestellen/frontend/node_modules /repo \
-    || s_fail "repository: kritieke of hoge bevinding (kwetsbaarheid, geheim of configuratie)"
-  if [ -z "${CI_SKIP_IMAGES:-}" ]; then
+  local vsev msev fix=""
+  vsev=$(cfg_list QualityGate security spec/thresholds/vulnerabilities/severities | paste -sd, -)
+  msev=$(cfg_list QualityGate security spec/thresholds/misconfigurations/severities | paste -sd, -)
+  [ "$(threshold security vulnerabilities/onlyWithFix true)" = true ] && fix=--ignore-unfixed
+  echo "== repository: vulnerabilities ($vsev), secrets"
+  trivy_r fs --exit-code 1 --severity "${vsev:-CRITICAL,HIGH}" --scanners vuln --offline-scan $fix \
+    --skip-dirs /repo/.fcd /repo || s_fail "repository: kwetsbaarheid ($vsev)"
+  trivy_r fs --exit-code 1 --scanners secret --skip-dirs /repo/.fcd /repo || [ "$(threshold security secrets/max 0)" != 0 ] \
+    || s_fail "repository: geheim gevonden"
+  echo "== repository: configuration ($msev)"
+  trivy_r fs --exit-code 1 --severity "${msev:-CRITICAL,HIGH}" --scanners misconfig --skip-dirs /repo/.fcd /repo \
+    || s_fail "repository: misconfiguratie ($msev)"
+  if [ -n "${CI_COMPOSE_FILES:-}" ]; then
     local img
     for img in $(images); do
       echo "== image $img"
       docker save -o "$R_DIR/scan/image.tar" "$img"
-      trivy_r image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed --input /scan/image.tar \
-        || s_fail "image $img: kritieke of hoge kwetsbaarheid"
+      trivy_r image --exit-code 1 --severity "${vsev:-CRITICAL,HIGH}" $fix --input /scan/image.tar \
+        || s_fail "image $img: kwetsbaarheid ($vsev)"
       rm -f "$R_DIR/scan/image.tar"
     done
   fi
   echo "== freshness"
-  if has ci_freshness; then
-    local rc=0; ci_freshness || rc=$?
-    case $rc in
-      0) echo "libraries fresh enough" ;;
-      1) s_fail "versheid: een library loopt een major-versie achter" ;;
-      *) s_warn "versheid niet te bepalen (netwerk?)" ;;
-    esac
-  else s_warn "geen versheidscontrole ingesteld"; fi
+  freshness
+}
+
+freshness() { # the repository reports "freshness|part|name|current|latest"; the threshold is in the configuration
+  has ci_freshness || { s_warn "geen versheidscontrole ingesteld"; return 0; }
+  local rc=0 max undetermined
+  max=$(threshold security freshness/maxMajorBehind 0); undetermined=$(threshold security freshness/undetermined warn)
+  ci_freshness >"$R_DIR/freshness.txt" || rc=$?
+  cat "$R_DIR/freshness.txt"
+  local parts part names minor
+  parts=$(awk -F'|' '$1 == "freshness" { print $2 }' "$R_DIR/freshness.txt" | sort -u)
+  while IFS= read -r part; do
+    [ -n "$part" ] || continue
+    names=$(awk -F'|' -v p="$part" -v m="$max" '$1 == "freshness" && $2 == p { split($4, a, "."); split($5, b, ".")
+      if (b[1] - a[1] > m) printf " %s %s->%s", $3, $4, $5 }' "$R_DIR/freshness.txt")
+    [ -z "$names" ] || s_fail "versheid $part: meer dan $max major-versie(s) achter:$names"
+  done <<EOF_PARTS
+$parts
+EOF_PARTS
+  minor=$(grep -c '^freshness|' "$R_DIR/freshness.txt" || true)
+  [ "$minor" -gt 0 ] && s_warn "versheid: $minor libraries hebben een nieuwere versie"
+  if [ "$rc" -ne 0 ]; then
+    if [ "$undetermined" = closed ]; then s_fail "versheid niet te bepalen"; else s_warn "versheid niet te bepalen (netwerk?)"; fi
+  fi
 }
 
 trivy_r() {
-  docker run --rm -v "$R_REPO":/repo:ro -v "$R_DIR/scan":/scan -v "$FCD_PIPELINE_DIR/trivy":/trivy:ro \
-    -v fcd-trivy-cache:/root/.cache "$TOOL_TRIVY" --quiet "$@"
+  docker run --rm -v "$R_REPO":/repo:ro -v "$R_DIR/scan":/scan -v fcd-trivy-cache:/root/.cache "$TOOL_TRIVY" --quiet "$@"
 }
 
-step_7() { # SBOM (CycloneDX) per image and licenses
+license_policy() { # the license policy of the security gate as a Trivy configuration (in $R_DIR/scan)
+  local cat item
+  {
+    echo "license:"
+    for cat in forbidden restricted allowed; do
+      case $cat in allowed) echo "  permissive:" ;; *) echo "  $cat:" ;; esac
+      cfg_list QualityGate security "spec/thresholds/licenses/$cat" | while IFS= read -r item; do echo "    - $item"; done
+    done
+    echo "  reciprocal: []"
+    echo "  notice: []"
+    echo "  unencumbered: []"
+  } >"$R_DIR/scan/trivy-license.yaml"
+}
+
+step_sbom_licenses() { # SBOM (CycloneDX) per image and licenses
   [ -n "${CI_COMPOSE_FILES:-}" ] || { s_skip "geen images in deze repository"; return 0; }
   mkdir -p "$R_DIR/sbom" "$R_DIR/scan"
-  local img file
+  license_policy
+  local img file lib_sev="MEDIUM,HIGH,CRITICAL" os_sev="CRITICAL"
+  [ "$(threshold security licenses/unknown closed)" = closed ] && lib_sev="UNKNOWN,$lib_sev"
+  [ "$(threshold security licenses/restrictedInBaseImage allowed)" = allowed ] || os_sev="HIGH,CRITICAL"
   for img in $(images); do
     file="$(printf '%s' "$img" | tr '/:' '__').cdx.json"
     echo "== sbom $img"
     docker save -o "$R_DIR/scan/image.tar" "$img"
-    docker run --rm -v "$R_DIR/scan":/scan -v "$R_DIR/sbom":/sbom "$TOOL_SYFT" scan "docker-archive:/scan/image.tar" -o "cyclonedx-json=/sbom/$file" -q \
-      || s_fail "SBOM van $img mislukt"
+    docker run --rm -v "$R_DIR/scan":/scan -v "$R_DIR/sbom":/sbom "$TOOL_SYFT" scan "docker-archive:/scan/image.tar" \
+      -o "$(cfg Step sbom-licenses spec/sbomFormat cyclonedx-json)=/sbom/$file" -q || s_fail "SBOM van $img mislukt"
     echo "== licenses $img (libraries)"
-    trivy_r image --config /trivy/trivy-license.yaml --scanners license --pkg-types library --exit-code 1 \
-      --severity UNKNOWN,MEDIUM,HIGH,CRITICAL --input /scan/image.tar \
-      || s_fail "image $img: licentie niet toegestaan of onbekend"
-    echo "== licenses $img (OS packages: only forbidden licenses stop)"
-    trivy_r image --config /trivy/trivy-license.yaml --scanners license --pkg-types os --exit-code 1 \
-      --severity CRITICAL --input /scan/image.tar \
-      || s_fail "image $img: verboden licentie in OS-pakket"
+    trivy_r image --config /scan/trivy-license.yaml --scanners license --pkg-types library --exit-code 1 \
+      --severity "$lib_sev" --input /scan/image.tar || s_fail "image $img: licentie niet toegestaan of onbekend"
+    echo "== licenses $img (OS packages of the base image)"
+    trivy_r image --config /scan/trivy-license.yaml --scanners license --pkg-types os --exit-code 1 \
+      --severity "$os_sev" --input /scan/image.tar || s_fail "image $img: licentie in OS-pakket niet toegestaan"
     rm -f "$R_DIR/scan/image.tar"
   done
   ls -l "$R_DIR/sbom"
 }
 
-step_8() { # deploy the whole sub-product
+step_deploy() { # deploy the whole sub-product (configuration: Pipeline.spec.deployTarget)
   [ -n "${CI_COMPOSE_FILES:-}" ] || { s_skip "geen containers om uit te rollen"; return 0; }
+  local target; target=$(cfg Pipeline "$R_PIPELINE" spec/deployTarget docker-compose)
+  [ "$target" = docker-compose ] || { s_fail "uitrollen naar $target kan de Pipeline nog niet (issue)"; return 0; }
   if [ "$R_ENV" = werkplek ]; then
     echo "werkplek: the short-lived environment is the deployment for the end-to-end tests"
     ephemeral_up || { s_fail "tijdelijke omgeving start niet"; return 0; }
@@ -480,13 +590,13 @@ step_8() { # deploy the whole sub-product
     return 0
   fi
   compose_r "$R_PROJECT" up -d --no-build --remove-orphans
-  wait_ready "$R_PROJECT" || { s_fail "$R_SUBPRODUCT niet bereikbaar binnen 60 s"; return 0; }
+  wait_ready "$R_PROJECT" || { s_fail "$R_SUBPRODUCT niet bereikbaar binnen $(threshold deploy readySeconds/max 60) s"; return 0; }
   compose_r "$R_PROJECT" ps
   step_state R_E2E_PROJECT "$R_PROJECT"
   step_state R_DEPLOYED 1
 }
 
-step_9() { # end-to-end tests with Playwright on the deployed sub-product
+step_end_to_end_tests() { # Playwright on the deployed sub-product
   [ -n "${CI_E2E_DIR:-}" ] || { s_skip "geen end-to-end tests ingesteld"; return 0; }
   local tag="fcd-e2e/$R_NAME:$R_VERSION"
   mkdir -p "$R_DIR/reports/e2e"; chmod 777 "$R_DIR/reports/e2e"
@@ -495,29 +605,32 @@ step_9() { # end-to-end tests with Playwright on the deployed sub-product
     --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true --shm-size 1g \
     -v "$R_DIR/reports/e2e":/reports -e PLAYWRIGHT_JUNIT_OUTPUT_FILE=/reports/TEST-e2e.xml \
     "$tag" --reporter=list,junit || true
-  report_tests end-to-end "$R_DIR/reports/e2e"
+  report_tests end-to-end "$R_DIR/reports/e2e" "$(threshold deploy endToEndTestsFailed/max 0)"
 }
 
-step_10() { # release: git tag + GitHub Release with the text from CHANGELOG.md
+step_release() { # git tag + GitHub Release with the text from CHANGELOG.md (configuration: Pipeline.spec.release)
   [ "$R_ENV" = lokaal ] || { s_skip "alleen na een merge op main (agent)"; return 0; }
   [ "$R_RELEASE" = 1 ] || { s_skip "geen nieuwe versie (mensgate niet van toepassing)"; return 0; }
-  local tag="v$R_VERSION" notes="$R_DIR/release-notes.md"
+  local pattern tag notes="$R_DIR/release-notes.md"
+  pattern=$(cfg Pipeline "$R_PIPELINE" spec/release/tag "v{version}"); tag=${pattern//\{version\}/$R_VERSION}
   changelog_section "$R_REPO" "$R_VERSION" >"$notes"
   [ -s "$notes" ] || { s_fail "geen tekst voor $R_VERSION in CHANGELOG.md"; return 0; }
   git -C "$R_REPO" tag -a "$tag" -m "$R_SUBPRODUCT $R_VERSION" "$R_SHA"
   git -C "$R_REPO" push origin "$tag"
-  if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
+  if [ "$(cfg Pipeline "$R_PIPELINE" spec/release/githubRelease true)" != true ]; then echo "no GitHub Release (configuration)"
+  elif command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
     local repo_url; repo_url=$(git -C "$R_REPO" remote get-url origin)
     gh release create "$tag" --repo "$repo_url" --title "$R_SUBPRODUCT $R_VERSION" --notes-file "$notes" --verify-tag
   else
     s_warn "gh ontbreekt: alleen de git-tag, geen GitHub Release"
   fi
   step_state R_RELEASED 1
+  step_state R_TAG "$tag"
 }
 
 # ---------------------------------------------------------------- ci
 
-start_run() { # repo env
+start_run() { # repo env showcase-dir
   R_REPO=$(cd "$1" && pwd); R_ENV=$2
   [ -f "$R_REPO/versions.env" ] || die "$R_REPO: geen versions.env"
   R_NAME=$(basename "$(git -C "$R_REPO" remote get-url origin 2>/dev/null || echo "$R_REPO")" .git)
@@ -525,15 +638,30 @@ start_run() { # repo env
   # Release tags are needed for the version and contract checks, also before a push.
   git -C "$R_REPO" fetch -q --tags origin 2>/dev/null || true
   R_SHA=$(git -C "$R_REPO" rev-parse --short HEAD)
-  # Commit time for the lead time: the merged commit (second parent of a merge), else HEAD.
-  local ts; ts=$(git -C "$R_REPO" log -1 --format=%at HEAD^2 2>/dev/null || git -C "$R_REPO" log -1 --format=%at HEAD)
-  R_COMMIT_TIME=$(date -u -r "$ts" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$ts" +%Y-%m-%dT%H:%M:%SZ)
   R_ID="$R_NAME-$(date -u +%Y%m%d-%H%M%S)-$R_SHA"
   R_DIR="$R_REPO/.fcd/runs/$R_ID"; mkdir -p "$R_DIR/reports"
-  R_PROJECT=$R_NAME
-  R_EPHEMERAL="$R_NAME-ci-$(printf '%s' "$R_SHA" | tr -cd 'a-z0-9')"
-  R_EXPERIMENT=${FCD_EXPERIMENT:-$(cat "$FCD_HOME/experiment" 2>/dev/null || echo mvp0)}
-  R_WARNINGS=""; R_RELEASE=0; R_RELEASED=0; R_DEPLOYED=0; R_E2E_PROJECT=""
+  # The configuration of the showcase this repository belongs to.
+  local sc=${3:-${FCD_SHOWCASE_DIR:-}}
+  [ -n "$sc" ] || sc=$(showcase_for_repo "$R_NAME" "$R_REPO")
+  if [ -z "$sc" ]; then
+    case "$R_NAME" in
+      fcd-pipeline|fcd-dashboard)
+        # D1 (interim): FCD's own sub-products, until their configuration is in fcd (issue in fcd).
+        export FCD_SHOWCASE_OVERRIDE=fcd; sc="$FCD_ROOT/fcd-demo"
+        info "D1: configuratie van FCD zelf staat nog niet in fcd; de configuratie van fcd-demo, showcase fcd" ;;
+      *) die "$R_NAME hoort bij geen showcase: geen fcd-*/fcd/*.fcd.yaml met repository: $R_NAME (of geef --showcase)" ;;
+    esac
+  fi
+  showcase_load "$sc" "$R_DIR/config.props"
+  R_PIPELINE=$(cfg_first Pipeline)
+  R_STEPS=$(cfg_list Pipeline "$R_PIPELINE" spec/steps)
+  R_STEP_COUNT=$(printf '%s\n' "$R_STEPS" | grep -c .)
+  local ts; ts=$(git -C "$R_REPO" log -1 --format=%at HEAD^2 2>/dev/null || git -C "$R_REPO" log -1 --format=%at HEAD)
+  R_COMMIT_TIME=$(date -u -r "$ts" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$ts" +%Y-%m-%dT%H:%M:%SZ)
+  R_PROJECT="$SC_PREFIX-$R_SUBPRODUCT"
+  R_EPHEMERAL="$R_PROJECT-ci-$(printf '%s' "$R_SHA" | tr -cd 'a-z0-9')"
+  R_EXPERIMENT=${FCD_EXPERIMENT:-$(experiment_of)}
+  R_WARNINGS=""; R_RELEASE=0; R_RELEASED=0; R_DEPLOYED=0; R_E2E_PROJECT=""; R_TAG=""
   R_RELEASE_TYPE=planned
   changelog_heading "$R_REPO" "$R_VERSION" | grep -qi noodpatch && R_RELEASE_TYPE=emergency
   trigger_of_head
@@ -541,7 +669,7 @@ start_run() { # repo env
   # shellcheck source=/dev/null
   [ -f "$R_REPO/ci/steps.sh" ] && . "$R_REPO/ci/steps.sh"
   R_CONTAINERS=$CI_SUBPRODUCT_CONTAINERS
-  # The deployed containers know their experiment and environment (key-result measurement).
+  # The deployed containers know their showcase, experiment and environment (key-result measurement).
   export FCD_EXPERIMENT="$R_EXPERIMENT" FCD_ENVIRONMENT="$R_ENV"
   trap 'ephemeral_down' EXIT
 }
@@ -567,52 +695,65 @@ finish_run() { # outcome reason
   say ""; say "run $R_ID: $1 (${dur}s)"; info "log lines: $R_DIR/events.jsonl"
 }
 
+gates_after() { # step -> the gates whose last step (in the order of the pipeline) is this step
+  local g s last
+  for g in $(cfg_names QualityGate); do
+    last=""
+    for s in $(cfg_list QualityGate "$g" spec/afterSteps); do
+      printf '%s\n' "$R_STEPS" | grep -qx "$s" && last=$s
+    done
+    [ "$last" = "$1" ] && printf '%s\n' "$g"
+  done
+}
+gates_before() { # step -> the gates that come before this step (such as the human gate before releasing)
+  local g
+  for g in $(cfg_names QualityGate); do cfg_list QualityGate "$g" spec/beforeSteps | grep -qx "$1" && printf '%s\n' "$g"; done
+  return 0
+}
+
 cmd_ci() {
-  local repo="." env=werkplek until=10
+  local repo="." env=werkplek until=999 sc=""
   while [ $# -gt 0 ]; do
     case $1 in
       --env) env=$2; shift 2 ;;
       --until) until=$2; shift 2 ;;
+      --showcase) sc=$2; shift 2 ;;
       -*) die "onbekende optie $1" ;;
       *) repo=$1; shift ;;
     esac
   done
   case $env in werkplek|lokaal) ;; *) die "--env werkplek of lokaal" ;; esac
-  start_run "$repo" "$env"
+  start_run "$repo" "$env" "$sc"
   R_T0=$(now_s)
-  say "${C_B}fcd ci${C_0} $R_NAME $R_SUBPRODUCT $R_VERSION @ $R_SHA (omgeving $R_ENV, $R_TRIGGER_KIND: $R_TRIGGER_NAME${R_RELEASE_TYPE:+, $R_RELEASE_TYPE})"
+  say "${C_B}fcd ci${C_0} $R_NAME $R_SUBPRODUCT $R_VERSION @ $R_SHA (showcase $SC_NAME, omgeving $R_ENV, $R_TRIGGER_KIND: $R_TRIGGER_NAME, $R_RELEASE_TYPE)"
   emit "dev.cdevents.pipelinerun.started.0.2.0" "$R_ID" "$(printf '{"pipelineName":%s,"outcome":"running"}' "$(json_str "$R_NAME")")"
-  local n
-  for n in 1 2 3 4 5 6 7 8 9; do
-    if [ "$n" -le "$until" ]; then run_step $n; fi
-    case $n in
-      3) gate code "1-3" ;;
-      5) if [ "$until" -ge 4 ]; then gate build "4-5"; fi ;;
-      7) if [ "$until" -ge 6 ]; then gate security "6-7"; fi ;;
-      9) if [ "$until" -ge 8 ]; then gate deploy "8-9"; fi ;;
-    esac
-  done
-  if [ "$R_DEPLOYED" = 1 ]; then
-    emit "dev.cdevents.service.deployed.0.2.0" "$R_SUBPRODUCT" "$(printf '{"environment":{"id":%s},"artifactId":%s}' "$(json_str "$R_ENV")" "$(json_str "pkg:git/$R_NAME@$R_SHA")")"
-  fi
-  if [ "$until" -ge 10 ]; then
-    human_gate
-    run_step 10
-    if [ "$R_RELEASED" = 1 ]; then
-      emit "dev.cdevents.artifact.published.0.2.0" "$R_SUBPRODUCT" "$(printf '{"tag":%s,"releaseType":%s}' "$(json_str "v$R_VERSION")" "$(json_str "$R_RELEASE_TYPE")")"
+  local n=0 step g
+  for step in $R_STEPS; do
+    n=$((n + 1))
+    [ "$n" -le "$until" ] || break
+    for g in $(gates_before "$step"); do human_gate "$g"; done
+    run_step "$n" "$step"
+    for g in $(gates_after "$step"); do gate "$g" "$(cfg_list QualityGate "$g" spec/afterSteps | paste -sd, -)"; done
+    if [ "$step" = deploy ] && [ "$R_DEPLOYED" = 1 ]; then
+      emit "dev.cdevents.service.deployed.0.2.0" "$R_SUBPRODUCT" "$(printf '{"environment":{"id":%s},"artifactId":%s}' "$(json_str "$R_ENV")" "$(json_str "pkg:git/$R_NAME@$R_SHA")")"
     fi
-  fi
+    if [ "$step" = release ] && [ "$R_RELEASED" = 1 ]; then
+      emit "dev.cdevents.artifact.published.0.2.0" "$R_SUBPRODUCT" "$(printf '{"tag":%s,"releaseType":%s}' "$(json_str "$R_TAG")" "$(json_str "$R_RELEASE_TYPE")")"
+    fi
+  done
   if [ -n "$GATE_REASONS" ]; then finish_run failure "$GATE_REASONS"; exit 1; fi
   finish_run success ""
 }
 
-human_gate() { # human gate: a merge on main with a higher sub-product version
+human_gate() { # gate: approval by a human (configuration: QualityGate.spec.approval)
+  local g=$1 approval; approval=$(cfg QualityGate "$g" spec/approval)
+  [ "$approval" = merge-on-main-with-higher-version ] || die "goedkeuring '$approval' kan de Pipeline nog niet (issue)"
   [ "$R_ENV" = lokaal ] || return 0
   local tag old; tag=$(last_tag "$R_REPO"); old=${tag#v}
   if [ -z "$tag" ] || ver_gt "$R_VERSION" "$old"; then
     R_RELEASE=1
-    emit "dev.cdeventsx.fcd-qualitygate.evaluated.0.1.0" "human-gate" "$(printf '{"gate":"human","afterSteps":"9","outcome":"open","reason":%s,"explain":""}' "$(json_str "goedgekeurd door $(git -C "$R_REPO" log -1 --format=%an HEAD): merge op main met versie $R_VERSION${tag:+ (was $old)}")")"
-    ok "${C_B}human-gate open${C_0}: merge op main, versie $R_VERSION"
+    emit "dev.cdeventsx.fcd-qualitygate.evaluated.0.1.0" "$g-gate" "$(printf '{"gate":%s,"afterSteps":"","outcome":"open","reason":%s,"explain":"","explainDetails":[]}' "$(json_str "$g")" "$(json_str "goedgekeurd door $(git -C "$R_REPO" log -1 --format=%an HEAD): merge op main met versie $R_VERSION${tag:+ (was $old)}")")"
+    ok "${C_B}$g-gate open${C_0}: merge op main, versie $R_VERSION"
   else
     info "geen nieuwe versie ($R_VERSION = $tag): niet releasen"
   fi
@@ -625,8 +766,6 @@ cmd_bump() {
   [ $# -eq 3 ] && { repo=$1; shift; }
   what=${1:?container of subproduct}; part=${2:?major, minor of patch}
   repo=$(cd "$repo" && pwd)
-  # Compare with the latest release, also when it was made by the Pipeline after the last fetch.
-  git -C "$repo" fetch -q --tags origin 2>/dev/null || true
   local var cur new
   if [ "$what" = subproduct ]; then var=SUBPRODUCT_VERSION; else var=$(container_var "$what"); fi
   cur=$(ver_get "$repo" "$var"); [ -n "$cur" ] || die "$var niet gevonden in versions.env"
@@ -653,95 +792,161 @@ bump_ver() { local a b c; IFS=. read -r a b c <<<"$1"
   case $2 in major) echo "$((a+1)).0.0" ;; minor) echo "$a.$((b+1)).0" ;; patch) echo "$a.$b.$((c+1))" ;; *) die "major, minor of patch" ;; esac; }
 set_ver() { sed -i.bak "s/^$2=.*/$2=$3/" "$1/versions.env" && rm -f "$1/versions.env.bak"; }
 
-# ---------------------------------------------------------------- agent (the Pipeline)
+# ---------------------------------------------------------------- pinned versions of Pipeline and Dashboard
 
-agent_repo_url() { # origin of the sibling checkout (so a fork uses its own repositories)
-  local root; root="$(dirname "$FCD_PIPELINE_DIR")"
-  git -C "$root/$1" remote get-url origin 2>/dev/null || echo "$FCD_ORG_URL/$1.git"
+repo_url() { # origin of the checkout next to the Pipeline (so a fork uses its own repositories)
+  git -C "$FCD_ROOT/$1" remote get-url origin 2>/dev/null || echo "$FCD_ORG_URL/$1.git"
 }
 
-agent_once() {
-  local r work state head last
-  mkdir -p "$FCD_HOME/work" "$FCD_HOME/state"
-  for r in $FCD_AGENT_REPOS; do
-    work="$FCD_HOME/work/$r"; state="$FCD_HOME/state/$r.last"
-    if [ ! -d "$work/.git" ]; then git clone -q "$(agent_repo_url "$r")" "$work" || { info "$r: clone mislukt"; continue; }; fi
+pinned() { # repository version -> a checkout of that release (tag v<version>), shared by all showcases
+  local repo=$1 ver=$2 src="$FCD_HOME/src/$1.git" dir="$FCD_HOME/versions/$1-$2"
+  if [ -n "${FCD_DEV:-}" ]; then printf '%s' "$FCD_ROOT/$repo"; return; fi   # development: the checkout next to it
+  [ -d "$dir" ] && { printf '%s' "$dir"; return; }
+  mkdir -p "$FCD_HOME/src" "$FCD_HOME/versions"
+  [ -d "$src" ] || git clone -q --bare "$(repo_url "$repo")" "$src"
+  git -C "$src" fetch -q --tags origin 2>/dev/null || true
+  git -C "$src" rev-parse -q --verify "refs/tags/v$ver" >/dev/null || die "$repo $ver bestaat nog niet (geen tag v$ver)"
+  git -C "$src" worktree add -q --detach "$dir" "v$ver" >/dev/null
+  printf '%s' "$dir"
+}
+
+pipeline_version() { cfg Pipeline "$(cfg_first Pipeline)" spec/uses/version; }
+dashboard_version() { cfg Dashboard "$(cfg_first Dashboard)" spec/uses/version; }
+
+dashboard_up() { # the Dashboard of the showcase: pinned version, own store, own port
+  local dir; dir=$(pinned fcd-dashboard "$(dashboard_version)")
+  local exp; exp=$(experiment_of)
+  DASHBOARD_DB_PASSWORD=$(fcd_secret dashboard-db) DEFAULT_EXPERIMENT="$exp" \
+    docker compose -p "$SC_PREFIX-dashboard" --project-directory "$dir" --env-file "$dir/versions.env" \
+    -f "$dir/docker-compose.yml" up -d --build --remove-orphans >"$SC_HOME/dashboard-up.log" 2>&1 \
+    || { tail -20 "$SC_HOME/dashboard-up.log"; die "Dashboard start niet"; }
+  ok "Dashboard $(dashboard_version) (showcase $SC_NAME): http://127.0.0.1:$PORT_DASHBOARD"
+}
+
+# ---------------------------------------------------------------- agent (the Pipeline)
+
+agent_repos() { # the product repositories of the showcase (configuration), or for D1 FCD's own repositories
+  if [ -n "${FCD_SHOWCASE_OVERRIDE:-}" ]; then printf '%s\n' fcd-pipeline fcd-dashboard; return; fi
+  local s; for s in $(cfg_names SubProduct); do cfg SubProduct "$s" spec/repository; done | sort -u
+}
+
+agent_once() { # showcase repository
+  local sc_src=$1 r work state head last cfgwork
+  mkdir -p "$SC_HOME/work" "$SC_HOME/state"
+  # GitOps: the configuration that counts is the one on main of the showcase repository.
+  local sc_name; sc_name=$(basename "$sc_src")
+  cfgwork="$SC_HOME/work/$sc_name"
+  [ -d "$cfgwork/.git" ] || git clone -q "$(git -C "$sc_src" remote get-url origin 2>/dev/null || echo "$sc_src")" "$cfgwork"
+  git -C "$cfgwork" fetch -q origin main 2>/dev/null || true
+  head=$(git -C "$cfgwork" rev-parse origin/main 2>/dev/null || echo none)
+  if [ "$head" != "$(cat "$SC_HOME/state/config.last" 2>/dev/null || true)" ]; then
+    git -C "$cfgwork" checkout -q --detach "$head" 2>/dev/null || true
+    if [ -s "$SC_HOME/state/config.last" ]; then
+      # A change in the configuration (such as a threshold): run every repository of the showcase again.
+      say "$(now_iso) configuratie $sc_name gewijzigd ($head): alles opnieuw door de pipeline"
+      rm -f "$SC_HOME"/state/repo-*.last
+      export FCD_CONFIG_CHANGED=1
+    fi
+    echo "$head" >"$SC_HOME/state/config.last"
+  fi
+  showcase_load "$cfgwork" "$SC_HOME/config.props"
+  local runner; runner="$(pinned fcd-pipeline "$(pipeline_version)")/fcd"
+  for r in $(agent_repos); do
+    work="$SC_HOME/work/$r"; state="$SC_HOME/state/repo-$r.last"
+    if [ ! -d "$work/.git" ]; then git clone -q "$(repo_url "$r")" "$work" || { info "$r: clone mislukt"; continue; }; fi
     # Only what is on main: what the product owner merged. Never code from a pull request.
     git -C "$work" fetch -q --prune --tags origin main 2>/dev/null || { info "$r: fetch mislukt"; continue; }
     head=$(git -C "$work" rev-parse origin/main)
     last=$(cat "$state" 2>/dev/null || true)
     [ "$head" = "$last" ] && continue
-    if ! git -C "$work" cat-file -e "$head:versions.env" 2>/dev/null; then
-      [ "$last" = "no-config:$head" ] || say "$(now_iso) $r: nog geen versions.env op main, overgeslagen"
-      echo "no-config:$head" >"$state"; continue
-    fi
-    say "$(now_iso) $r: nieuw op main $head"
+    say "$(now_iso) $r: nieuw op main $head (Pipeline $(pipeline_version))"
     git -C "$work" checkout -q --detach "$head" && git -C "$work" clean -qfdx -e .fcd
-    # GitOps also for the Pipeline itself: run the fcd that is merged on main (its own checkout,
-    # updated first in this loop), never a working copy.
-    local runner="$FCD_HOME/work/fcd-demo-pipeline/fcd"
-    [ -x "$runner" ] || runner=$FCD_SELF
-    if "$runner" ci "$work" --env lokaal; then say "$(now_iso) $r: gelukt"; else say "$(now_iso) $r: gestopt (gate dicht of fout)"; fi
+    if FCD_SHOWCASE_DIR="$cfgwork" "$runner" ci "$work" --env lokaal; then say "$(now_iso) $r: gelukt"
+    else say "$(now_iso) $r: gestopt (gate dicht of fout)"; fi
     echo "$head" >"$state"
   done
 }
 
 cmd_agent() {
-  [ "${1:-}" = --once ] && { agent_once; return; }
-  say "$(now_iso) Pipeline-agent $FCD_VERSION gestart: ${FCD_AGENT_REPOS} (elke ${FCD_AGENT_INTERVAL}s)"
-  while true; do agent_once || true; flush_outbox_quiet; sleep "$FCD_AGENT_INTERVAL"; done
+  local sc="" once=0
+  while [ $# -gt 0 ]; do case $1 in --showcase) sc=$2; shift 2 ;; --once) once=1; shift ;; *) die "fcd agent --showcase dir [--once]" ;; esac; done
+  sc=$(cd "$(showcase_dir_arg "$sc")" && pwd)
+  showcase_load "$sc" "$(mktemp)"
+  [ "$once" = 1 ] && { agent_once "$sc"; return; }
+  say "$(now_iso) Pipeline-agent gestart: showcase $SC_NAME (elke ${FCD_AGENT_INTERVAL}s)"
+  while true; do agent_once "$sc" || true; flush_outbox >/dev/null 2>&1 || true; sleep "$FCD_AGENT_INTERVAL"; done
 }
-flush_outbox_quiet() { flush_outbox >/dev/null 2>&1 || true; }
 
-cmd_up() {
-  mkdir -p "$FCD_HOME"
-  local r root; root="$(dirname "$FCD_PIPELINE_DIR")"
-  for r in fcd-demo-dashboard sk-demo; do
-    if docker compose -p "$r" ps -a -q 2>/dev/null | grep -q .; then docker compose -p "$r" start >/dev/null && ok "$r gestart"; fi
+agent_running() { [ -f "$SC_HOME/agent.pid" ] && kill -0 "$(cat "$SC_HOME/agent.pid")" 2>/dev/null; }
+
+cmd_up() { # one command per showcase: its Dashboard and its Pipeline agent, with its configuration and versions
+  local sc=""; [ "${1:-}" = --showcase ] && sc=$2
+  sc=$(cd "$(showcase_dir_arg "$sc")" && pwd)
+  showcase_load "$sc" "$(mktemp)"
+  say "${C_B}fcd up${C_0} showcase $SC_NAME: Pipeline $(pipeline_version), Dashboard $(dashboard_version)"
+  dashboard_up
+  local p; for p in $(docker compose ls -a --format json 2>/dev/null | tr ',' '\n' | sed -n 's/.*"Name":"\([^"]*\)".*/\1/p' | grep "^$SC_PREFIX-" | grep -v -- "-dashboard$" | grep -v -- "-ci-"); do
+    docker compose -p "$p" start >/dev/null 2>&1 && ok "$p gestart"
   done
-  if [ -f "$FCD_HOME/agent.pid" ] && kill -0 "$(cat "$FCD_HOME/agent.pid")" 2>/dev/null; then ok "Pipeline-agent draait al"
+  if agent_running; then ok "Pipeline-agent draait al"
   else
-    nohup "$FCD_SELF" agent >>"$FCD_HOME/agent.log" 2>&1 &
-    echo $! >"$FCD_HOME/agent.pid"; ok "Pipeline-agent gestart (log: fcd logs)"
+    local runner; runner="$(pinned fcd-pipeline "$(pipeline_version)")/fcd"
+    nohup "$runner" agent --showcase "$SC_REPO" >>"$SC_HOME/agent.log" 2>&1 &
+    echo $! >"$SC_HOME/agent.pid"; ok "Pipeline-agent $(pipeline_version) gestart (log: fcd logs)"
   fi
   info "Eerste keer? De agent bouwt en rolt alles uit vanaf main; dat duurt even. Volg het met: fcd logs"
-  say "ShowKitchen: http://127.0.0.1:8080   Dashboard: http://127.0.0.1:8070"
+  local k env; env=$(cfg_first Environment)
+  for k in $(cfg_keys Environment "$env" spec/ports); do say "  $k: http://127.0.0.1:$(cfg Environment "$env" "spec/ports/$k")"; done
 }
 
 cmd_down() {
-  if [ -f "$FCD_HOME/agent.pid" ]; then kill "$(cat "$FCD_HOME/agent.pid")" 2>/dev/null || true; rm -f "$FCD_HOME/agent.pid"; ok "Pipeline-agent gestopt"; fi
-  local r; for r in sk-demo fcd-demo-dashboard; do docker compose -p "$r" stop >/dev/null 2>&1 && ok "$r gestopt" || true; done
+  local sc=""; [ "${1:-}" = --showcase ] && sc=$2
+  showcase_load "$(cd "$(showcase_dir_arg "$sc")" && pwd)" "$(mktemp)"
+  if [ -f "$SC_HOME/agent.pid" ]; then kill "$(cat "$SC_HOME/agent.pid")" 2>/dev/null || true; rm -f "$SC_HOME/agent.pid"; ok "Pipeline-agent gestopt"; fi
+  local p; for p in $(docker compose ls --format json 2>/dev/null | tr ',' '\n' | sed -n 's/.*"Name":"\([^"]*\)".*/\1/p' | grep "^$SC_PREFIX-"); do
+    docker compose -p "$p" stop >/dev/null 2>&1 && ok "$p gestopt"
+  done
 }
 
 cmd_status() {
-  if [ -f "$FCD_HOME/agent.pid" ] && kill -0 "$(cat "$FCD_HOME/agent.pid")" 2>/dev/null; then ok "Pipeline-agent draait"; else bad "Pipeline-agent draait niet (fcd up)"; fi
-  docker ps --filter "label=com.docker.compose.project" --format '{{.Label "com.docker.compose.project"}}\t{{.Names}}\t{{.Image}}\t{{.Status}}' | grep -E '^(sk-demo|fcd-demo)' || true
+  local sc=""; [ "${1:-}" = --showcase ] && sc=$2
+  showcase_load "$(cd "$(showcase_dir_arg "$sc")" && pwd)" "$(mktemp)"
+  if agent_running; then ok "Pipeline-agent draait (showcase $SC_NAME)"; else bad "Pipeline-agent draait niet (fcd up)"; fi
+  docker ps --filter "label=com.docker.compose.project" --format '{{.Label "com.docker.compose.project"}}\t{{.Names}}\t{{.Image}}\t{{.Status}}' | grep "^$SC_PREFIX-" || true
 }
 
-cmd_report() { # save the status report of the Dashboard in fcd-demo/reports (to keep, share and compare)
-  local base="${FCD_DASHBOARD_URL%/api/v1/events}" root dir exp file
-  root="$(dirname "$FCD_PIPELINE_DIR")"; dir="$root/fcd-demo/reports"; mkdir -p "$dir"
+cmd_logs() {
+  local sc=""; [ "${1:-}" = --showcase ] && sc=$2
+  showcase_load "$(cd "$(showcase_dir_arg "$sc")" && pwd)" "$(mktemp)"
+  tail -n 50 -f "$SC_HOME/agent.log"
+}
+
+cmd_report() { # the status report and the log of the experiment, in the showcase repository (to keep, share and compare)
+  local sc=""; [ "${1:-}" = --showcase ] && sc=$2
+  showcase_load "$(cd "$(showcase_dir_arg "$sc")" && pwd)" "$(mktemp)"
+  local base="${FCD_DASHBOARD_URL%/api/v1/events}" exp file
   exp=$(curl -fsS -m 10 "$base/api/v1/overview" | sed -n 's/.*"experiment":"\([^"]*\)".*/\1/p' | head -1)
-  [ -n "$exp" ] || die "Dashboard niet bereikbaar op $base"
-  file="$dir/$(date -u +%Y-%m-%d-%H%M)-demo-$exp.md"
+  [ -n "$exp" ] || die "Dashboard van $SC_NAME niet bereikbaar op $base"
+  mkdir -p "$SC_REPO/reports" "$SC_REPO/log"
+  file="$SC_REPO/reports/$(date -u +%Y-%m-%d-%H%M)-$SC_NAME-$exp.md"
   curl -fsS -m 10 "$base/api/v1/report?experiment=$exp" >"$file"
   ok "statusrapport: $file"
+  curl -fsS -m 30 "$base/api/v1/events?experiment=$exp" >"$SC_REPO/log/$exp.jsonl"
+  ok "log: $SC_REPO/log/$exp.jsonl ($(wc -l <"$SC_REPO/log/$exp.jsonl" | tr -d ' ') logregels)"
 }
 
-cmd_experiment() { # experiment start <name> | experiment: every experiment starts with an empty log
-  local cur; cur=$(cat "$FCD_HOME/experiment" 2>/dev/null || echo mvp0)
-  case "${1:-}" in
-    start)
-      local name=${2:?naam van het experiment, zoals mvp1}
-      printf '%s' "$name" | grep -Eq '^[A-Za-z0-9._-]{1,50}$' || die "alleen letters, cijfers, . _ - (max 50)"
-      mkdir -p "$FCD_HOME"; printf '%s\n' "$name" >"$FCD_HOME/experiment"
-      # Run every repository again, so the deployed containers measure in the new experiment too.
-      rm -f "$FCD_HOME"/state/*.last
-      ok "experiment $name gestart (was $cur). De log van $cur blijft bewaard en is te kiezen in het Dashboard."
-      info "De agent haalt alles opnieuw door de pipeline; daarna meten de containers in $name." ;;
-    "") say "$cur" ;;
-    *) die "fcd experiment [start <naam>]" ;;
-  esac
+cmd_experiment() { # experiment [start <name>]: every experiment starts with an empty log
+  local action="" name="" sc=""
+  while [ $# -gt 0 ]; do case $1 in start) action=start; name=${2:-}; shift 2 || shift ;; --showcase) sc=$2; shift 2 ;; *) die "fcd experiment [start <naam>] [--showcase dir]" ;; esac; done
+  showcase_load "$(cd "$(showcase_dir_arg "$sc")" && pwd)" "$(mktemp)"
+  local cur; cur=$(experiment_of)
+  if [ "$action" != start ]; then say "$cur"; return; fi
+  printf '%s' "$name" | grep -Eq '^[A-Za-z0-9._-]{1,50}$' || die "naam: alleen letters, cijfers, . _ - (max 50)"
+  printf '%s\n' "$name" >"$SC_HOME/experiment"
+  # Run every repository again, so the deployed containers measure in the new experiment too.
+  rm -f "$SC_HOME"/state/repo-*.last
+  ok "experiment $name gestart in showcase $SC_NAME (was $cur). De log van $cur blijft bewaard en is te kiezen in het Dashboard."
+  info "De agent haalt alles opnieuw door de pipeline; daarna meten de containers in $name."
 }
 
 cmd_hooks() { # install the pre-push hook: the same CI steps and gates before every push
@@ -755,17 +960,17 @@ EOF
 }
 
 case "${1:-}" in
-  check)   shift; cmd_check "$@" ;;
-  hooks)   shift; cmd_hooks "$@" ;;
-  report)  shift; cmd_report "$@" ;;
+  check)      shift; cmd_check "$@" ;;
+  hooks)      shift; cmd_hooks "$@" ;;
+  report)     shift; cmd_report "$@" ;;
   experiment) shift; cmd_experiment "$@" ;;
-  ci)      shift; cmd_ci "$@" ;;
-  bump)    shift; cmd_bump "$@" ;;
-  agent)   shift; cmd_agent "$@" ;;
-  up)      shift; cmd_up "$@" ;;
-  down)    shift; cmd_down "$@" ;;
-  status)  shift; cmd_status "$@" ;;
-  logs)    shift; tail -n 50 -f "$FCD_HOME/agent.log" ;;
-  version) echo "fcd $FCD_VERSION" ;;
-  *) sed -n '2,15p' "$FCD_SELF" | sed 's/^# \{0,1\}//'; exit 1 ;;
+  ci)         shift; cmd_ci "$@" ;;
+  bump)       shift; cmd_bump "$@" ;;
+  agent)      shift; cmd_agent "$@" ;;
+  up)         shift; cmd_up "$@" ;;
+  down)       shift; cmd_down "$@" ;;
+  status)     shift; cmd_status "$@" ;;
+  logs)       shift; cmd_logs "$@" ;;
+  version)    echo "fcd $FCD_VERSION" ;;
+  *) sed -n '2,22p' "$FCD_SELF" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
