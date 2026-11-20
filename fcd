@@ -437,14 +437,25 @@ registry_call() { # method path [body] -> prints "status body"
   code=$(curl -sS -m 20 -o "$out" -w '%{http_code}' -X "$1" -H 'Content-Type: application/json' ${3:+-d "$3"} "$FCD_REGISTRY_URL/groups/$SC_NAME$2" 2>/dev/null || echo 000)
   printf '%s %s' "$code" "$(tr -d '\n' <"$out" | cut -c1-400)"; rm -f "$out"
 }
-contract_content() { # dir file type -> {"content": ..., "contentType": ...}
-  local ct=application/x-yaml; [ "$3" = JSON ] && ct=application/json
-  printf '{"content":%s,"contentType":"%s"}' "$(json_str "$(cat "$1/$2")")" "$ct"
+contract_content() { # name dir file type -> {"content": ..., "contentType": ..., "references": [...]}
+  # References (configuration: Contract.spec.references): a $ref to another contract, such as ./logline.schema.json,
+  # resolved by the register to that contract in the version that is in the same files.
+  local name=$1 dir=$2 file=$3 type=$4 ct=application/x-yaml refs="" i ref rc rfile rtype rver
+  [ "$type" = JSON ] && ct=application/json
+  i=0
+  while ref=$(cfg Contract "$name" "spec/references/$i/name"); [ -n "$ref" ]; do
+    rc=$(cfg Contract "$name" "spec/references/$i/contract")
+    rfile=$(cfg Contract "$rc" spec/file); rtype=$(cfg Contract "$rc" spec/type OPENAPI)
+    rver=$(contract_version "$dir" "$rfile" "$rtype")
+    refs="${refs:+$refs,}$(printf '{"name":%s,"groupId":%s,"artifactId":%s,"version":%s}' "$(json_str "$ref")" "$(json_str "$SC_NAME")" "$(json_str "$rc")" "$(json_str "$rver")")"
+    i=$((i + 1))
+  done
+  printf '{"content":%s,"contentType":"%s","references":[%s]}' "$(json_str "$(cat "$dir/$file")")" "$ct" "$refs"
 }
 registry_has() { [ "$(registry_call GET "/artifacts/$1/versions/$2" | cut -d' ' -f1)" = 200 ]; }
 registry_add() { # name version dir file type dry -> prints "status body"; creates the artifact (with its rules) when it is new
   local name=$1 ver=$2 dir=$3 file=$4 type=$5 dry=${6:-} content r
-  content=$(contract_content "$dir" "$file" "$type")
+  content=$(contract_content "$name" "$dir" "$file" "$type")
   if [ "$(registry_call GET "/artifacts/$name" | cut -d' ' -f1)" != 200 ]; then
     [ -n "$dry" ] && { printf '200 new contract'; return; }
     r=$(registry_call POST /artifacts "$(printf '{"artifactId":"%s","artifactType":"%s","firstVersion":{"version":"%s","content":%s}}' "$name" "$type" "$ver" "$content")")
@@ -938,7 +949,7 @@ registry_start() { # the API-register of the showcase (Apicurio Registry, tool o
 }
 
 registry_seed() { # fill the register from git: every contract of the configuration, as in its released version
-  local c repo file type ref src tmp ver n=0
+  local c repo file type ref src tmp ver r n=0
   for c in $(cfg_names Contract); do
     repo=$(cfg Contract "$c" spec/repository); file=$(cfg Contract "$c" spec/file); type=$(cfg Contract "$c" spec/type OPENAPI)
     case "$repo" in
@@ -952,7 +963,10 @@ registry_seed() { # fill the register from git: every contract of the configurat
     if [ -f "$tmp/$file" ]; then
       ver=$(contract_version "$tmp" "$file" "$type")
       if [ -z "$ver" ]; then info "  contract $c in $repo $ref heeft nog geen versie: niet geregistreerd"
-      elif ! registry_has "$c" "$ver"; then registry_add "$c" "$ver" "$tmp" "$file" "$type" >/dev/null; n=$((n + 1)); fi
+      elif ! registry_has "$c" "$ver"; then
+        r=$(registry_add "$c" "$ver" "$tmp" "$file" "$type")
+        case "${r%% *}" in 200) n=$((n + 1)) ;; *) bad "  contract $c $ver niet geregistreerd (${r%% *}: $(printf '%s' "$r" | sed -n 's/.*"title":"\([^"]*\)".*/\1/p'))" ;; esac
+      fi
     fi
     rm -rf "$tmp"
   done

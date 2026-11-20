@@ -4,6 +4,12 @@ Alle wijzigingen per versie. Formaat: [Keep a Changelog](https://keepachangelog.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-21
+
+### Opgelost
+- Een contract dat naar een ander contract verwijst (`$ref`, zoals het eindpunt van de logregel naar het schema) wordt geregistreerd met een referentie naar dat contract in het register (configuratie: `Contract.spec.references`). Zonder referentie kon Apicurio geen nieuwe versie vergelijken.
+- Een contractversie die niet geregistreerd kan worden bij het vullen van het register wordt gemeld, niet verzwegen.
+
 ## [0.5.0] - 2026-11-21
 
 ### Toegevoegd
