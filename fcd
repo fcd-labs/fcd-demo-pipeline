@@ -114,7 +114,8 @@ showcase_load() { # showcase repository dir, a place for the flattened config
     v=$(cfg Environment "$env" "spec/ports/$k")
     export "PORT_$(printf '%s' "$k" | tr '[:lower:]-' '[:upper:]_')=$v"
   done
-  if [ -n "${FCD_SHOWCASE_OVERRIDE:-}" ]; then export PORT_DASHBOARD="${FCD_PORT_DASHBOARD:-8370}"; fi
+  if [ -n "${FCD_SHOWCASE_OVERRIDE:-}" ]; then export PORT_DASHBOARD="${FCD_PORT_DASHBOARD:-8370}" PORT_REGISTRY="${FCD_PORT_REGISTRY:-8371}"; fi
+  FCD_REGISTRY_URL="${FCD_REGISTRY_URL:-http://127.0.0.1:${PORT_REGISTRY:-0}/apis/registry/v3}"
   FCD_DASHBOARD_URL="${FCD_DASHBOARD_URL:-http://127.0.0.1:${PORT_DASHBOARD:-0}/api/v1/events}"
   export DASHBOARD_EVENTS_URL="http://host.docker.internal:${PORT_DASHBOARD:-0}/api/v1/events"
   export FCD_SHOWCASE="$SC_NAME"
@@ -415,28 +416,105 @@ unit_from_dockerfile() { # name context [dockerfile] [build-arg...]: export targ
   docker build --target test-reports --output "type=local,dest=$R_DIR/reports/unit/$name" $args "$@" "$R_REPO/$ctx"
 }
 
-step_contract_test() { # lint OpenAPI + no unnoticed breaking change
-  [ -n "${CI_OPENAPI:-}" ] || { s_skip "geen OpenAPI-contract in deze repository"; return 0; }
-  local spec tag base_major new_major
-  for spec in $CI_OPENAPI; do
-    echo "== lint $spec"
-    docker run --rm -v "$R_REPO":/spec:ro -w /spec "$TOOL_REDOCLY" lint "$spec" || [ "$(threshold code contractLintErrors/max 0)" != 0 ] || s_fail "contract $spec: lint-fouten"
-  done
+contracts_of_repo() { # the contracts of this repository (configuration: Contract.spec.repository)
+  local c; for c in $(cfg_names Contract); do [ "$(cfg Contract "$c" spec/repository)" = "$R_NAME" ] && printf '%s\n' "$c"; done; return 0
+}
+contract_version() { # dir file type -> the version in the contract itself (OpenAPI info.version, JSON Schema x-version)
+  local q='.info.version' p=yaml; [ "$3" = JSON ] && { q='."x-version"'; p=json; }
+  docker run --rm -v "$1":/c:ro "$TOOL_YQ" -p "$p" "$q" "/c/$2" 2>/dev/null | grep -v '^null$' || true
+}
+
+# -- API-register (Apicurio Registry, one per showcase): group = showcase, artifact = contract name
+registry_up_ok() { curl -fsS -m 3 -o /dev/null "$FCD_REGISTRY_URL/system/info" 2>/dev/null; }
+registry_call() { # method path [body] -> prints "status body"
+  local out code; out=$(mktemp)
+  code=$(curl -sS -m 20 -o "$out" -w '%{http_code}' -X "$1" -H 'Content-Type: application/json' ${3:+-d "$3"} "$FCD_REGISTRY_URL/groups/$SC_NAME$2" 2>/dev/null || echo 000)
+  printf '%s %s' "$code" "$(tr -d '\n' <"$out" | cut -c1-400)"; rm -f "$out"
+}
+contract_content() { # dir file type -> {"content": ..., "contentType": ...}
+  local ct=application/x-yaml; [ "$3" = JSON ] && ct=application/json
+  printf '{"content":%s,"contentType":"%s"}' "$(json_str "$(cat "$1/$2")")" "$ct"
+}
+registry_has() { [ "$(registry_call GET "/artifacts/$1/versions/$2" | cut -d' ' -f1)" = 200 ]; }
+registry_add() { # name version dir file type dry -> prints "status body"; creates the artifact (with its rules) when it is new
+  local name=$1 ver=$2 dir=$3 file=$4 type=$5 dry=${6:-} content r
+  content=$(contract_content "$dir" "$file" "$type")
+  if [ "$(registry_call GET "/artifacts/$name" | cut -d' ' -f1)" != 200 ]; then
+    [ -n "$dry" ] && { printf '200 new contract'; return; }
+    r=$(registry_call POST /artifacts "$(printf '{"artifactId":"%s","artifactType":"%s","firstVersion":{"version":"%s","content":%s}}' "$name" "$type" "$ver" "$content")")
+    registry_call POST "/artifacts/$name/rules" "$(printf '{"ruleType":"COMPATIBILITY","config":"%s"}' "$(cfg Contract "$name" spec/compatibility BACKWARD)")" >/dev/null
+    registry_call POST "/artifacts/$name/rules" '{"ruleType":"VALIDITY","config":"FULL"}' >/dev/null
+    printf '%s' "$r"; return
+  fi
+  registry_call POST "/artifacts/$name/versions${dry:+?dryRun=true}" "$(printf '{"version":"%s","content":%s}' "$ver" "$content")"
+}
+
+step_contract_test() { # per contract of the configuration: lint, a new version when it changed, not broken (oasdiff, Apicurio)
+  local contracts; contracts=$(contracts_of_repo)
+  [ -n "$contracts" ] || { s_skip "geen contract van deze repository in de configuratie"; return 0; }
+  local tag base="" base_major new_major registry=1
   tag=$(last_tag "$R_REPO")
-  if [ -z "$tag" ]; then echo "no previous release: no breaking-change check"; return 0; fi
-  base_major=${tag#v}; base_major=${base_major%%.*}; new_major=${R_VERSION%%.*}
-  # The whole repository as it was at the previous release, so references between files ($ref) resolve.
-  local base="$R_DIR/contract-base"
-  rm -rf "$base"; mkdir -p "$base"
-  git -C "$R_REPO" archive "$tag" | tar -x -C "$base"
-  for spec in $CI_OPENAPI; do
-    [ -f "$base/$spec" ] || { echo "$spec is new since $tag"; continue; }
-    echo "== breaking changes $spec since $tag"
-    if ! docker run --rm -v "$R_REPO":/new:ro -v "$base":/base:ro "$TOOL_OASDIFF" breaking "/base/$spec" "/new/$spec" --fail-on ERR; then
-      if [ "$new_major" -gt "$base_major" ]; then echo "breaking change with a new major version: allowed"
-      elif [ "$(threshold code breakingChanges/withoutNewMajor 0)" != 0 ]; then echo "breaking change allowed by the threshold"
-      else s_fail "contract $spec: breaking change zonder nieuwe major-versie"; fi
+  if [ -n "$tag" ]; then
+    # The whole repository as it was at the previous release, so references between files ($ref) resolve.
+    base="$R_DIR/contract-base"; rm -rf "$base"; mkdir -p "$base"
+    git -C "$R_REPO" archive "$tag" | tar -x -C "$base"
+    base_major=${tag#v}; base_major=${base_major%%.*}
+  fi
+  new_major=${R_VERSION%%.*}
+  if ! registry_up_ok; then
+    registry=0
+    if [ -n "${FCD_SHOWCASE_OVERRIDE:-}" ]; then s_warn "API-register van showcase $SC_NAME niet bereikbaar (D1): geen controle in Apicurio"
+    else s_fail "API-register niet bereikbaar op $FCD_REGISTRY_URL (fcd up)"; fi
+  fi
+  local c file type ver bver r
+  for c in $contracts; do
+    file=$(cfg Contract "$c" spec/file); type=$(cfg Contract "$c" spec/type OPENAPI)
+    echo "== contract $c ($type, $file)"
+    [ -f "$R_REPO/$file" ] || { s_fail "contract $c: $file ontbreekt"; continue; }
+    if [ "$type" = OPENAPI ]; then
+      docker run --rm -v "$R_REPO":/spec:ro -w /spec "$TOOL_REDOCLY" lint "$file" || [ "$(threshold code contractLintErrors/max 0)" != 0 ] || s_fail "contract $c: lint-fouten"
     fi
+    ver=$(contract_version "$R_REPO" "$file" "$type")
+    [ -n "$ver" ] || { s_fail "contract $c heeft geen versie"; continue; }
+    bver=""
+    if [ -n "$base" ] && [ -f "$base/$file" ]; then
+      bver=$(contract_version "$base" "$file" "$type")
+      if ! cmp -s "$base/$file" "$R_REPO/$file" && [ "$ver" = "$bver" ]; then
+        s_fail "contract $c is veranderd zonder nieuwe versie (nog $ver)"
+      fi
+      if [ "$type" = OPENAPI ] && ! cmp -s "$base/$file" "$R_REPO/$file"; then
+        echo "== breaking changes $c since $tag (oasdiff)"
+        if ! docker run --rm -v "$R_REPO":/new:ro -v "$base":/base:ro "$TOOL_OASDIFF" breaking "/base/$file" "/new/$file" --fail-on ERR; then
+          if [ "$new_major" -gt "$base_major" ]; then echo "breaking change with a new major version: allowed"
+          elif [ "$(threshold code breakingChanges/withoutNewMajor 0)" != 0 ]; then echo "breaking change allowed by the threshold"
+          else s_fail "contract $c $ver: brekende wijziging (oasdiff)"; fi
+        fi
+      fi
+    fi
+    [ "$registry" = 1 ] || continue
+    # After a restart (storage in memory) the register is filled again from git: the version of the previous release.
+    if [ -n "$bver" ] && ! registry_has "$c" "$bver"; then
+      r=$(registry_add "$c" "$bver" "$base" "$file" "$type"); echo "register: $c $bver from $tag (${r%% *})"
+    fi
+    if registry_has "$c" "$ver"; then echo "register: $c $ver is registered"; continue; fi
+    r=$(registry_add "$c" "$ver" "$R_REPO" "$file" "$type" dry)
+    case "${r%% *}" in
+      200) echo "register: $c $ver compatible ($(cfg Contract "$c" spec/compatibility BACKWARD))" ;;
+      409|400) s_fail "contract $c $ver: niet $(cfg Contract "$c" spec/compatibility BACKWARD | tr '[:upper:]' '[:lower:]') compatibel volgens het API-register ($(printf '%s' "$r" | sed -n 's/.*"description":"\([^"]*\)".*/\1/p' | head -1))" ;;
+      *) s_fail "contract $c $ver: API-register gaf ${r%% *}"; echo "$r" ;;
+    esac
+  done
+}
+
+register_contracts() { # after a release: every new version of a contract of this repository in the API-register
+  registry_up_ok || { s_warn "API-register niet bereikbaar: contracten niet geregistreerd"; return 0; }
+  local c file type ver r
+  for c in $(contracts_of_repo); do
+    file=$(cfg Contract "$c" spec/file); type=$(cfg Contract "$c" spec/type OPENAPI)
+    ver=$(contract_version "$R_REPO" "$file" "$type")
+    [ -n "$ver" ] && ! registry_has "$c" "$ver" || continue
+    r=$(registry_add "$c" "$ver" "$R_REPO" "$file" "$type")
+    case "${r%% *}" in 200) echo "register: $c $ver registered" ;; *) s_warn "contract $c $ver niet geregistreerd (${r%% *})" ;; esac
   done
 }
 
@@ -642,6 +720,7 @@ step_release() { # git tag + GitHub Release with the text from CHANGELOG.md (con
   else
     s_warn "gh ontbreekt: alleen de git-tag, geen GitHub Release"
   fi
+  register_contracts
   step_state R_RELEASED 1
   step_state R_TAG "$tag"
 }
@@ -683,7 +762,7 @@ start_run() { # repo env showcase-dir
   R_RELEASE_TYPE=planned
   changelog_heading "$R_REPO" "$R_VERSION" | grep -qi noodpatch && R_RELEASE_TYPE=emergency
   trigger_of_head
-  CI_COMPOSE_FILES=""; CI_OPENAPI=""; CI_CONTRACT_TARGETS=""; CI_E2E_DIR=""; CI_READY_URL=""; CI_SUBPRODUCT_CONTAINERS=""
+  CI_COMPOSE_FILES=""; CI_CONTRACT_TARGETS=""; CI_E2E_DIR=""; CI_READY_URL=""; CI_SUBPRODUCT_CONTAINERS=""
   # shellcheck source=/dev/null
   [ -f "$R_REPO/ci/steps.sh" ] && . "$R_REPO/ci/steps.sh"
   R_CONTAINERS=$CI_SUBPRODUCT_CONTAINERS
@@ -842,6 +921,14 @@ dashboard_up() { # the Dashboard of the showcase: pinned version, own store, own
   ok "Dashboard $(dashboard_version) (showcase $SC_NAME): http://127.0.0.1:$PORT_DASHBOARD"
 }
 
+registry_start() { # the API-register of the showcase (Apicurio Registry, tool of FCD)
+  [ -n "${PORT_REGISTRY:-}" ] || { info "geen poort voor het API-register in de configuratie"; return 0; }
+  TOOL_APICURIO="$TOOL_APICURIO" docker compose -p "$SC_PREFIX-registry" -f "$FCD_PIPELINE_DIR/tools/registry.compose.yml" up -d >/dev/null 2>&1 \
+    || die "API-register start niet"
+  local i; for i in $(seq 1 60); do registry_up_ok && break; sleep 2; done
+  registry_up_ok && ok "API-register (Apicurio Registry, in het geheugen): http://127.0.0.1:$PORT_REGISTRY" || bad "API-register reageert niet"
+}
+
 # ---------------------------------------------------------------- agent (the Pipeline)
 
 agent_repos() { # the product repositories of the showcase (configuration), or for D1 FCD's own repositories
@@ -897,7 +984,7 @@ cmd_agent() {
 }
 
 showcase_projects() { # the exact compose projects of the showcase (never a prefix match: other projects may share it)
-  printf '%s\n' "$SC_PREFIX-dashboard"
+  printf '%s\n' "$SC_PREFIX-dashboard" "$SC_PREFIX-registry"
   local sp; for sp in $(cfg_names SubProduct); do printf '%s\n' "$SC_PREFIX-$sp"; done
 }
 project_exists() { docker compose -p "$1" ps -a -q 2>/dev/null | grep -q .; }
@@ -910,7 +997,8 @@ cmd_up() { # one command per showcase: its Dashboard and its Pipeline agent, wit
   showcase_load "$sc" "$(mktemp)"
   say "${C_B}fcd up${C_0} showcase $SC_NAME: Pipeline $(pipeline_version), Dashboard $(dashboard_version)"
   dashboard_up
-  local p; for p in $(showcase_projects | grep -vx "$SC_PREFIX-dashboard"); do
+  registry_start
+  local p; for p in $(showcase_projects | grep -vx "$SC_PREFIX-dashboard" | grep -vx "$SC_PREFIX-registry"); do
     project_exists "$p" && docker compose -p "$p" start >/dev/null 2>&1 && ok "$p gestart"
   done
   if agent_running; then ok "Pipeline-agent draait al"
