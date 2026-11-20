@@ -10,6 +10,7 @@
 #   fcd agent [--once]             the Pipeline: fetch main (GitOps), run ci, deploy, release
 #   fcd up | down | status | logs  start or stop the Pipeline agent and the deployed sub-products
 #   fcd report                     save the status report of the Dashboard in fcd-demo/reports
+#   fcd experiment [start <name>]  show the experiment, or start a new one with an empty log
 #   fcd version
 #
 # Works with bash 3.2 (macOS) and any docker runtime with `docker` and `docker compose`.
@@ -727,6 +728,22 @@ cmd_report() { # save the status report of the Dashboard in fcd-demo/reports (to
   ok "statusrapport: $file"
 }
 
+cmd_experiment() { # experiment start <name> | experiment: every experiment starts with an empty log
+  local cur; cur=$(cat "$FCD_HOME/experiment" 2>/dev/null || echo mvp0)
+  case "${1:-}" in
+    start)
+      local name=${2:?naam van het experiment, zoals mvp1}
+      printf '%s' "$name" | grep -Eq '^[A-Za-z0-9._-]{1,50}$' || die "alleen letters, cijfers, . _ - (max 50)"
+      mkdir -p "$FCD_HOME"; printf '%s\n' "$name" >"$FCD_HOME/experiment"
+      # Run every repository again, so the deployed containers measure in the new experiment too.
+      rm -f "$FCD_HOME"/state/*.last
+      ok "experiment $name gestart (was $cur). De log van $cur blijft bewaard en is te kiezen in het Dashboard."
+      info "De agent haalt alles opnieuw door de pipeline; daarna meten de containers in $name." ;;
+    "") say "$cur" ;;
+    *) die "fcd experiment [start <naam>]" ;;
+  esac
+}
+
 cmd_hooks() { # install the pre-push hook: the same CI steps and gates before every push
   local repo; repo=$(cd "${1:-.}" && pwd)
   cat >"$repo/.git/hooks/pre-push" <<EOF
@@ -741,6 +758,7 @@ case "${1:-}" in
   check)   shift; cmd_check "$@" ;;
   hooks)   shift; cmd_hooks "$@" ;;
   report)  shift; cmd_report "$@" ;;
+  experiment) shift; cmd_experiment "$@" ;;
   ci)      shift; cmd_ci "$@" ;;
   bump)    shift; cmd_bump "$@" ;;
   agent)   shift; cmd_agent "$@" ;;
