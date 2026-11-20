@@ -4,6 +4,15 @@ Alle wijzigingen per versie. Formaat: [Keep a Changelog](https://keepachangelog.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-20
+
+### Toegevoegd
+- `fcd report`: bewaart het statusrapport van het Dashboard in `fcd-demo/reports/`.
+- De uitgerolde containers krijgen experiment en omgeving mee (`FCD_EXPERIMENT`, `FCD_ENVIRONMENT`), voor de meting van het key result.
+
+### Gewijzigd
+- GitOps ook voor de Pipeline zelf: de agent draait de `fcd` die op `main` staat (zijn eigen checkout, als eerste bijgewerkt), nooit een werkkopie.
+
 ## [0.2.0] - 2026-11-20
 
 ### Toegevoegd

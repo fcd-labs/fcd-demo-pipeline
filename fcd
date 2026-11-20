@@ -9,6 +9,7 @@
 #   fcd hooks [repo]               install the pre-push hook (same steps and gates before a push)
 #   fcd agent [--once]             the Pipeline: fetch main (GitOps), run ci, deploy, release
 #   fcd up | down | status | logs  start or stop the Pipeline agent and the deployed sub-products
+#   fcd report                     save the status report of the Dashboard in fcd-demo/reports
 #   fcd version
 #
 # Works with bash 3.2 (macOS) and any docker runtime with `docker` and `docker compose`.
@@ -22,7 +23,7 @@ FCD_DASHBOARD_URL="${FCD_DASHBOARD_URL:-http://127.0.0.1:8070/api/v1/events}"
 FCD_SHOWCASE="${FCD_SHOWCASE:-demo}"
 FCD_EXPERIMENT="${FCD_EXPERIMENT:-}"
 FCD_ORG_URL="${FCD_ORG_URL:-https://github.com/fcd-labs}"
-FCD_AGENT_REPOS="${FCD_AGENT_REPOS:-fcd-demo-dashboard sk-demo fcd-demo-pipeline}"
+FCD_AGENT_REPOS="${FCD_AGENT_REPOS:-fcd-demo-pipeline fcd-demo-dashboard sk-demo}"
 FCD_AGENT_INTERVAL="${FCD_AGENT_INTERVAL:-30}"
 
 # shellcheck source=tools.env
@@ -534,6 +535,8 @@ start_run() { # repo env
   # shellcheck source=/dev/null
   [ -f "$R_REPO/ci/steps.sh" ] && . "$R_REPO/ci/steps.sh"
   R_CONTAINERS=$CI_SUBPRODUCT_CONTAINERS
+  # The deployed containers know their experiment and environment (key-result measurement).
+  export FCD_EXPERIMENT="$R_EXPERIMENT" FCD_ENVIRONMENT="$R_ENV"
   trap 'ephemeral_down' EXIT
 }
 
@@ -663,7 +666,11 @@ agent_once() {
     fi
     say "$(now_iso) $r: nieuw op main $head"
     git -C "$work" checkout -q --detach "$head" && git -C "$work" clean -qfdx -e .fcd
-    if "$FCD_SELF" ci "$work" --env lokaal; then say "$(now_iso) $r: gelukt"; else say "$(now_iso) $r: gestopt (gate dicht of fout)"; fi
+    # GitOps also for the Pipeline itself: run the fcd that is merged on main (its own checkout,
+    # updated first in this loop), never a working copy.
+    local runner="$FCD_HOME/work/fcd-demo-pipeline/fcd"
+    [ -x "$runner" ] || runner=$FCD_SELF
+    if "$runner" ci "$work" --env lokaal; then say "$(now_iso) $r: gelukt"; else say "$(now_iso) $r: gestopt (gate dicht of fout)"; fi
     echo "$head" >"$state"
   done
 }
@@ -700,6 +707,16 @@ cmd_status() {
   docker ps --filter "label=com.docker.compose.project" --format '{{.Label "com.docker.compose.project"}}\t{{.Names}}\t{{.Image}}\t{{.Status}}' | grep -E '^(sk-demo|fcd-demo)' || true
 }
 
+cmd_report() { # save the status report of the Dashboard in fcd-demo/reports (to keep, share and compare)
+  local base="${FCD_DASHBOARD_URL%/api/v1/events}" root dir exp file
+  root="$(dirname "$FCD_PIPELINE_DIR")"; dir="$root/fcd-demo/reports"; mkdir -p "$dir"
+  exp=$(curl -fsS -m 10 "$base/api/v1/overview" | sed -n 's/.*"experiment":"\([^"]*\)".*/\1/p' | head -1)
+  [ -n "$exp" ] || die "Dashboard niet bereikbaar op $base"
+  file="$dir/$(date -u +%Y-%m-%d-%H%M)-demo-$exp.md"
+  curl -fsS -m 10 "$base/api/v1/report?experiment=$exp" >"$file"
+  ok "statusrapport: $file"
+}
+
 cmd_hooks() { # install the pre-push hook: the same CI steps and gates before every push
   local repo; repo=$(cd "${1:-.}" && pwd)
   cat >"$repo/.git/hooks/pre-push" <<EOF
@@ -713,6 +730,7 @@ EOF
 case "${1:-}" in
   check)   shift; cmd_check "$@" ;;
   hooks)   shift; cmd_hooks "$@" ;;
+  report)  shift; cmd_report "$@" ;;
   ci)      shift; cmd_ci "$@" ;;
   bump)    shift; cmd_bump "$@" ;;
   agent)   shift; cmd_agent "$@" ;;
