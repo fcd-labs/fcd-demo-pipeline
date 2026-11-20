@@ -72,3 +72,18 @@ YAML
   printf -- '- id: EXP-001\n  gate: security\n  rule: "versheid"\n  reason: "Angular 21 -> 22"\n  approver: Johannes\n  until: 2026-12-31\n' >"$R_REPO/explains.yaml"
   [ "$(explain_json EXP-001)" = '{"id":"EXP-001","gate":"security","rule":"versheid","reason":"Angular 21 -> 22","approver":"Johannes","until":"2026-12-31"}' ]
 }
+
+@test "bump raises the sub-product version once per change, compared with main" {
+  d=$(mktemp -d); cd "$d"
+  git init -q -b main origin.git --bare 2>/dev/null || git init -q --bare origin.git
+  git clone -q origin.git work 2>/dev/null; cd work
+  git config user.email t@example.com; git config user.name t
+  printf 'SUBPRODUCT=x\nSUBPRODUCT_VERSION=0.3.0\nX_BACKEND_VERSION=0.3.0\n' >versions.env
+  git add versions.env; git commit -qm one; git push -q origin HEAD:main
+  run cmd_bump . x-backend minor
+  [ "$(ver_get . SUBPRODUCT_VERSION)" = 0.4.0 ]
+  [ "$(ver_get . X_BACKEND_VERSION)" = 0.4.0 ]
+  run cmd_bump . x-backend patch
+  [ "$(ver_get . SUBPRODUCT_VERSION)" = 0.4.0 ]
+  [ "$(ver_get . X_BACKEND_VERSION)" = 0.4.1 ]
+}

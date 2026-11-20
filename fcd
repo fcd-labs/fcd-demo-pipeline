@@ -632,9 +632,12 @@ cmd_bump() {
   new=$(bump_ver "$cur" "$part")
   set_ver "$repo" "$var" "$new"; ok "$var $cur -> $new"
   if [ "$what" != subproduct ]; then
-    # A new container version means a new sub-product version (once per release).
-    local sp tag; sp=$(ver_get "$repo" SUBPRODUCT_VERSION); tag=$(last_tag "$repo")
-    if [ -z "$tag" ] || [ "$(ver_at_ref "$repo" "$tag" SUBPRODUCT_VERSION)" = "$sp" ]; then
+    # A new container version means a new sub-product version, once per change: compare with main,
+    # because everything merged on main with a higher version is released by the Pipeline.
+    local sp base; sp=$(ver_get "$repo" SUBPRODUCT_VERSION)
+    git -C "$repo" fetch -q origin main 2>/dev/null || true
+    base=$(ver_at_ref "$repo" origin/main SUBPRODUCT_VERSION)
+    if [ -z "$base" ] || [ "$base" = "$sp" ]; then
       local nsp; nsp=$(bump_ver "$sp" "$part"); set_ver "$repo" SUBPRODUCT_VERSION "$nsp"; ok "SUBPRODUCT_VERSION $sp -> $nsp"
     fi
   fi

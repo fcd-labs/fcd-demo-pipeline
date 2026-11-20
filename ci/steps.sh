@@ -7,6 +7,7 @@ ci_lint() {
 }
 ci_unit() {
   mkdir -p "$R_DIR/reports/unit"
-  docker run --rm -v "$R_REPO":/code:ro -v "$R_DIR/reports/unit":/reports -w /code "$TOOL_BATS" \
+  docker build -q -t fcd-tmp/pipeline-tests "$R_REPO/tests" >/dev/null
+  docker run --rm -v "$R_REPO":/code:ro -v "$R_DIR/reports/unit":/reports -w /code fcd-tmp/pipeline-tests \
     --report-formatter junit --output /reports tests || true
 }
