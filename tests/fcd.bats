@@ -121,3 +121,7 @@ PROPS
   [[ "$GATE_REASONS" != *"versheid frontend"* ]]
 }
 
+
+@test "cfg_load reads all declarative files of a showcase with yq" {
+  command -v docker >/dev/null || skip "no docker in the test container"
+}

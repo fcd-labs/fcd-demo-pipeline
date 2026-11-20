@@ -63,9 +63,11 @@ CFG=""
 cfg_load() { # showcase repository dir -> $CFG (a file)
   local dir=$1 out=$2
   ls "$dir"/fcd/*.fcd.yaml >/dev/null 2>&1 || die "$dir: geen declaratieve bestanden (fcd/*.fcd.yaml)"
+  local files=() f
+  for f in "$dir"/fcd/*.fcd.yaml; do files+=("/cfg/$(basename "$f")"); done
   docker run --rm -v "$dir/fcd":/cfg:ro "$TOOL_YQ" ea \
     '. as $d | $d | .. | select(tag != "!!map" and tag != "!!seq") | ($d.kind + "/" + $d.metadata.name + "/" + (path | join("/"))) + "=" + (. | tostring)' \
-    /cfg/*.fcd.yaml >"$out"
+    "${files[@]}" >"$out" || die "configuratie van $dir niet te lezen"
   CFG=$out
 }
 cfg() { # kind name path [default]
@@ -794,7 +796,8 @@ set_ver() { sed -i.bak "s/^$2=.*/$2=$3/" "$1/versions.env" && rm -f "$1/versions
 
 # ---------------------------------------------------------------- pinned versions of Pipeline and Dashboard
 
-repo_url() { # origin of the checkout next to the Pipeline (so a fork uses its own repositories)
+repo_url() { # where a repository comes from: FCD_REPO_BASE (a fork or a test), else the origin of the checkout next to the Pipeline
+  if [ -n "${FCD_REPO_BASE:-}" ]; then printf '%s/%s.git' "$FCD_REPO_BASE" "$1"; return; fi
   git -C "$FCD_ROOT/$1" remote get-url origin 2>/dev/null || echo "$FCD_ORG_URL/$1.git"
 }
 

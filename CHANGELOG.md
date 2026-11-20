@@ -4,6 +4,20 @@ Alle wijzigingen per versie. Formaat: [Keep a Changelog](https://keepachangelog.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-20
+
+### Gewijzigd
+- Deelproduct van het product FCD (was fcd-demo), voor alle showcases. Repository `fcd-pipeline`.
+- Alles wat per showcase verschilt komt uit de configuratie van de showcase (`fcd-<showcase>/fcd/*.fcd.yaml`): stappen en volgorde, quality gates en drempels, uitrollen en releasen, goedgekeurde afwijkingen, omgeving (poorten, projectnamen) en de vastgelegde versies van Pipeline en Dashboard.
+- Data per showcase: eigen outbox, status, experiment en geheimen (`~/.fcd/<showcase>/`), eigen projectnamen (`<prefix>-<deelproduct>`).
+- Versheid: het product meldt feiten (`freshness|onderdeel|naam|huidig|nieuwste`); de drempel staat in de configuratie.
+- Het licentiebeleid komt uit de configuratie (geen vast bestand meer).
+
+### Toegevoegd
+- `fcd up --showcase <dir>`: het Dashboard en de Pipeline-agent van de showcase, in de vastgelegde versies (git-tags, lokaal gebouwd).
+- De agent volgt ook de showcase-repository: een wijziging in de configuratie haalt de deelproducten opnieuw door de pipeline.
+- `fcd report` bewaart ook de log van het experiment (`log/<experiment>.jsonl`) in de showcase-repository.
+
 ## [0.3.3] - 2026-11-20
 
 ### Toegevoegd
