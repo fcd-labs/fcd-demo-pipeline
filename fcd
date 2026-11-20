@@ -329,7 +329,9 @@ explain_for() { # gate reason -> id of an approved, not expired explain (configu
     g=$(cfg Explanation "$id" spec/gate); rule=$(cfg Explanation "$id" spec/rule)
     appr=$(cfg Explanation "$id" spec/approver); until=$(cfg Explanation "$id" spec/until); subject=$(cfg Explanation "$id" spec/subject)
     [ "$g" = "$1" ] && [ -n "$rule" ] && [ -n "$appr" ] || continue
-    [ -z "$subject" ] || [ "$subject" = "$R_NAME" ] || continue
+    # subject: one repository, or subjects: a list (empty = every repository of the showcase)
+    if [ -n "$subject" ]; then [ "$subject" = "$R_NAME" ] || continue
+    elif cfg_list Explanation "$id" spec/subjects | grep -q .; then cfg_list Explanation "$id" spec/subjects | grep -qx "$R_NAME" || continue; fi
     [ -z "$until" ] || [ ! "$until" \< "$today" ] || continue
     case "$2" in *"$rule"*) printf '%s' "$id"; return ;; esac
   done

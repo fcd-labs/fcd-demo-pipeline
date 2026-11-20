@@ -51,11 +51,18 @@ Explanation/EXP-OTHER/spec/gate=security
 Explanation/EXP-OTHER/spec/rule=licentie
 Explanation/EXP-OTHER/spec/subject=fcd-dashboard
 Explanation/EXP-OTHER/spec/approver=Johannes
+Explanation/EXP-LIST/spec/gate=security
+Explanation/EXP-LIST/spec/rule=versheid backend
+Explanation/EXP-LIST/spec/subjects/0=sk-demo
+Explanation/EXP-LIST/spec/subjects/1=fcd-dashboard
+Explanation/EXP-LIST/spec/approver=Johannes
 PROPS
   [ "$(explain_for security 'versheid frontend (npm): meer dan 0 major-versie(s) achter')" = EXP-001 ]
   [ -z "$(explain_for security 'image x: kwetsbaarheid (CRITICAL,HIGH)')" ]
   [ -z "$(explain_for security 'image x: licentie niet toegestaan')" ]
   [ -z "$(explain_for code 'versheid frontend: x')" ]
+  [ "$(explain_for security 'versheid backend (maven): x')" = EXP-LIST ]
+  R_NAME=fcd-pipeline; [ -z "$(explain_for security 'versheid backend (maven): x')" ]
 }
 
 @test "a gate keeps every reason, and an explain covers only its own" {
