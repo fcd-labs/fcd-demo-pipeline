@@ -92,7 +92,11 @@ showcase_for_repo() { # repo dir -> showcase repository dir: the fcd-* next to i
   local name=$1 d
   for d in "$FCD_ROOT"/fcd-*/fcd "$(dirname "$2")"/fcd-*/fcd; do
     [ -d "$d" ] || continue
-    if grep -qE "^[[:space:]]*repository:[[:space:]]*${name}[[:space:]]*$" "$d"/*.fcd.yaml 2>/dev/null; then dirname "$d"; return; fi
+    # Only a SubProduct makes a repository part of the showcase (a Contract may name another repository).
+    grep -qE "repository:[[:space:]]*${name}[[:space:]]*$" "$d"/*.fcd.yaml 2>/dev/null || continue
+    if docker run --rm -v "$d":/cfg:ro "$TOOL_YQ" ea 'select(.kind == "SubProduct") | .spec.repository' /cfg/*.fcd.yaml 2>/dev/null | grep -qx "$name"; then
+      dirname "$d"; return
+    fi
   done
 }
 showcase_load() { # showcase repository dir, a place for the flattened config
@@ -443,7 +447,8 @@ registry_add() { # name version dir file type dry -> prints "status body"; creat
     [ -n "$dry" ] && { printf '200 new contract'; return; }
     r=$(registry_call POST /artifacts "$(printf '{"artifactId":"%s","artifactType":"%s","firstVersion":{"version":"%s","content":%s}}' "$name" "$type" "$ver" "$content")")
     registry_call POST "/artifacts/$name/rules" "$(printf '{"ruleType":"COMPATIBILITY","config":"%s"}' "$(cfg Contract "$name" spec/compatibility BACKWARD)")" >/dev/null
-    registry_call POST "/artifacts/$name/rules" '{"ruleType":"VALIDITY","config":"FULL"}' >/dev/null
+    # SYNTAX_ONLY: FULL cannot follow a $ref to a separate schema file (such as logline.openapi.yaml -> logline.schema.json).
+    registry_call POST "/artifacts/$name/rules" '{"ruleType":"VALIDITY","config":"SYNTAX_ONLY"}' >/dev/null
     printf '%s' "$r"; return
   fi
   registry_call POST "/artifacts/$name/versions${dry:+?dryRun=true}" "$(printf '{"version":"%s","content":%s}' "$ver" "$content")"
@@ -926,7 +931,30 @@ registry_start() { # the API-register of the showcase (Apicurio Registry, tool o
   TOOL_APICURIO="$TOOL_APICURIO" docker compose -p "$SC_PREFIX-registry" -f "$FCD_PIPELINE_DIR/tools/registry.compose.yml" up -d >/dev/null 2>&1 \
     || die "API-register start niet"
   local i; for i in $(seq 1 60); do registry_up_ok && break; sleep 2; done
-  registry_up_ok && ok "API-register (Apicurio Registry, in het geheugen): http://127.0.0.1:$PORT_REGISTRY" || bad "API-register reageert niet"
+  registry_up_ok && ok "API-register (Apicurio Registry, in het geheugen): http://127.0.0.1:$PORT_REGISTRY" || { bad "API-register reageert niet"; return 0; }
+  registry_seed
+}
+
+registry_seed() { # fill the register from git: every contract of the configuration, as in its released version
+  local c repo file type ref src tmp ver n=0
+  for c in $(cfg_names Contract); do
+    repo=$(cfg Contract "$c" spec/repository); file=$(cfg Contract "$c" spec/file); type=$(cfg Contract "$c" spec/type OPENAPI)
+    case "$repo" in
+      fcd-dashboard) src=$(pinned fcd-dashboard "$(dashboard_version)"); ref=HEAD ;;
+      fcd-pipeline)  src=$(pinned fcd-pipeline "$(pipeline_version)"); ref=HEAD ;;
+      *) src="$FCD_ROOT/$repo"; git -C "$src" fetch -q --tags origin 2>/dev/null || true; ref=$(last_tag "$src") ;;
+    esac
+    [ -n "$ref" ] && [ -d "$src" ] || continue
+    tmp=$(mktemp -d)
+    git -C "$src" archive "$ref" 2>/dev/null | tar -x -C "$tmp" 2>/dev/null || { rm -rf "$tmp"; continue; }
+    if [ -f "$tmp/$file" ]; then
+      ver=$(contract_version "$tmp" "$file" "$type")
+      if [ -z "$ver" ]; then info "  contract $c in $repo $ref heeft nog geen versie: niet geregistreerd"
+      elif ! registry_has "$c" "$ver"; then registry_add "$c" "$ver" "$tmp" "$file" "$type" >/dev/null; n=$((n + 1)); fi
+    fi
+    rm -rf "$tmp"
+  done
+  ok "API-register gevuld uit git ($n nieuwe contractversies)"
 }
 
 # ---------------------------------------------------------------- agent (the Pipeline)

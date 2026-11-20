@@ -4,6 +4,16 @@ Alle wijzigingen per versie. Formaat: [Keep a Changelog](https://keepachangelog.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-21
+
+### Toegevoegd
+- API-register per showcase: Apicurio Registry (Apache-2.0) als tool van FCD, gestart door `fcd up`, opslag in het geheugen (afwijking EXP-003). `fcd up` vult het register uit git: alle contracten uit de configuratie, in hun vrijgegeven versie.
+- Stap 3 (contracttest) per contract uit de configuratie (`kind: Contract`): lint, een nieuwe versie als het contract veranderde, geen brekende wijziging volgens oasdiff (OpenAPI) en volgens de compatibiliteitsregel in het API-register (BACKWARD). Een brekende wijziging laat de codegate dichtvallen.
+- Na een release registreert de Pipeline elke nieuwe contractversie in het register.
+
+### Gewijzigd
+- Welke contracten een repository heeft, staat in de configuratie van de showcase, niet meer in `ci/steps.sh` (`CI_OPENAPI` is weg).
+
 ## [0.4.1] - 2026-11-20 - Noodpatch
 
 ### Opgelost
