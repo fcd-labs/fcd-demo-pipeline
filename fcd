@@ -153,6 +153,15 @@ custom_data() {
     "$(json_str "$FCD_SHOWCASE")" "$(json_str "$R_EXPERIMENT")" "$(json_str "$R_ENV")" "$(json_str "$R_RELEASE_TYPE")"
 }
 
+fcd_secret() { # name: a generated secret for this machine, never in git (~/.fcd/secrets, mode 600)
+  local f="$FCD_HOME/secrets/$1"
+  if [ ! -s "$f" ]; then
+    mkdir -p "$FCD_HOME/secrets"; chmod 700 "$FCD_HOME/secrets"
+    (umask 077; LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32 >"$f")
+  fi
+  cat "$f"
+}
+
 container_var() { printf '%s_VERSION' "$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')"; }
 
 # ---------------------------------------------------------------- steps
@@ -202,7 +211,7 @@ has() { declare -F "$1" >/dev/null; }
 
 gate() { # name after_steps
   # An approved explain covers only the reasons that contain its rule; any other reason closes the gate.
-  local name=$1 after=$2 outcome=open reason="" explains="" open_reasons="" r id
+  local name=$1 after=$2 outcome=open reason="" explains="" open_reasons="" r id nl=$'\n'
   if [ -n "$GATE_REASONS" ]; then
     while IFS= read -r r; do
       [ -n "$r" ] || continue
@@ -214,12 +223,13 @@ gate() { # name after_steps
         open_reasons="${open_reasons:+$open_reasons; }$r"
       fi
     done <<EOF_REASONS
-$(printf '%s\n' "$GATE_REASONS" | sed 's/; /\
-/g')
+${GATE_REASONS//; /$nl}
 EOF_REASONS
     if [ -n "$open_reasons" ]; then outcome=closed; reason="$open_reasons${reason:+; $reason}"; fi
   fi
-  emit "dev.cdeventsx.fcd-qualitygate.evaluated.0.1.0" "$name-gate" "$(printf '{"gate":%s,"afterSteps":%s,"outcome":%s,"reason":%s,"explain":%s}' "$(json_str "$name")" "$(json_str "$after")" "$(json_str "$outcome")" "$(json_str "$reason")" "$(json_str "$explains")")"
+  local details="" x
+  for x in ${explains//,/ }; do details="${details:+$details,}$(explain_json "$x")"; done
+  emit "dev.cdeventsx.fcd-qualitygate.evaluated.0.1.0" "$name-gate" "$(printf '{"gate":%s,"afterSteps":%s,"outcome":%s,"reason":%s,"explain":%s,"explainDetails":[%s]}' "$(json_str "$name")" "$(json_str "$after")" "$(json_str "$outcome")" "$(json_str "$reason")" "$(json_str "$explains")" "$details")"
   GATE_REASONS=""
   if [ "$outcome" = closed ]; then
     bad "${C_B}$name-gate dicht${C_0}: $reason"
@@ -227,6 +237,18 @@ EOF_REASONS
     exit 1
   fi
   ok "${C_B}$name-gate open${C_0}${reason:+ ($reason)}"
+}
+
+explain_json() { # id -> {"id","gate","rule","reason","approver","until"} from explains.yaml
+  local field v out=""
+  for field in gate rule reason approver until; do
+    v=$(awk -v want="$1" -v f="$field" '
+      function val(line) { sub(/^[^:]*:[ ]*/, "", line); sub(/[ ]+#.*$/, "", line); gsub(/^"|"$/, "", line); return line }
+      /^- id:/ { cur = val($0) }
+      cur == want && $0 ~ "^  " f ":" { print val($0); exit }' "$R_REPO/explains.yaml")
+    out="$out,$(json_str "$field"):$(json_str "$v")"
+  done
+  printf '{"id":%s%s}' "$(json_str "$1")" "$out"
 }
 
 explain_for() { # gate reason -> id of an approved, not expired explain whose rule is part of the reason
@@ -347,8 +369,9 @@ compose_r() { # docker compose for the repository, project $1
   docker compose -p "$p" --project-directory "$R_REPO" --env-file "$R_REPO/versions.env" $files "$@"
 }
 
-step_4() { # build all images, tags follow versions.env
+step_4() { # build all images, tags follow versions.env; fetch the images that are not built here
   [ -n "${CI_COMPOSE_FILES:-}" ] || { s_skip "geen containers in deze repository"; return 0; }
+  compose_r "$R_PROJECT" pull --ignore-buildable --quiet
   compose_r "$R_PROJECT" build
   compose_r "$R_PROJECT" config --images
 }

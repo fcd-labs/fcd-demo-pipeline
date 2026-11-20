@@ -4,6 +4,18 @@ Alle wijzigingen per versie. Formaat: [Keep a Changelog](https://keepachangelog.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-20
+
+### Toegevoegd
+- De gate-logregel bevat de details van gebruikte afwijkingen (`explainDetails`: regel, reden, goedkeurder, einddatum).
+- `fcd_secret`: een gegenereerd geheim per machine in `~/.fcd/secrets`, nooit in git.
+- Stap 4 haalt ook de images op die niet zelf gebouwd worden.
+
+### Opgelost
+- Bij twee redenen tegelijk verdween het scheidingsteken in de reden van een gate.
+- De trigger van een merge op `main` is de persoon die mergede, niet de AI die de commits schreef; ook de goedkeurder in de mensgate.
+- De agent slaat repositories zonder `versions.env` over, zonder foutmelding.
+
 ## [0.1.0] - 2026-11-20
 
 ### Toegevoegd
