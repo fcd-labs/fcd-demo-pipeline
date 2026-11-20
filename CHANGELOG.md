@@ -4,6 +4,8 @@ Alle wijzigingen per versie. Formaat: [Keep a Changelog](https://keepachangelog.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-20
+
 ### Toegevoegd
 - `fcd`: het bash-script dat de enige weg is. `check`, `ci` (CI-stappen 1–10 met code-, bouw-, security-, uitrol- en mensgate), `bump`, `hooks` (pre-push), `agent`, `up`, `down`, `status`, `logs`.
 - Na elke stap en gate een logregel (CDEvents) naar het Dashboard; zonder Dashboard in een outbox die later wordt verstuurd.

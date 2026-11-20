@@ -201,13 +201,25 @@ s_warn() { step_state R_WARNINGS "${R_WARNINGS:+$R_WARNINGS; }$*"; R_WARNINGS="$
 has() { declare -F "$1" >/dev/null; }
 
 gate() { # name after_steps
-  local name=$1 after=$2 outcome=open reason="" explain=""
+  # An approved explain covers only the reasons that contain its rule; any other reason closes the gate.
+  local name=$1 after=$2 outcome=open reason="" explains="" open_reasons="" r id
   if [ -n "$GATE_REASONS" ]; then
-    explain=$(explain_for "$name")
-    if [ -n "$explain" ]; then reason="afwijking $explain: $GATE_REASONS"
-    else outcome=closed; reason=$GATE_REASONS; fi
+    while IFS= read -r r; do
+      [ -n "$r" ] || continue
+      id=$(explain_for "$name" "$r")
+      if [ -n "$id" ]; then
+        case ",$explains," in *",$id,"*) ;; *) explains="${explains:+$explains,}$id" ;; esac
+        reason="${reason:+$reason; }afwijking $id: $r"
+      else
+        open_reasons="${open_reasons:+$open_reasons; }$r"
+      fi
+    done <<EOF_REASONS
+$(printf '%s\n' "$GATE_REASONS" | sed 's/; /\
+/g')
+EOF_REASONS
+    if [ -n "$open_reasons" ]; then outcome=closed; reason="$open_reasons${reason:+; $reason}"; fi
   fi
-  emit "dev.cdeventsx.fcd-qualitygate.evaluated.0.1.0" "$name-gate" "$(printf '{"gate":%s,"afterSteps":%s,"outcome":%s,"reason":%s,"explain":%s}' "$(json_str "$name")" "$(json_str "$after")" "$(json_str "$outcome")" "$(json_str "$reason")" "$(json_str "$explain")")"
+  emit "dev.cdeventsx.fcd-qualitygate.evaluated.0.1.0" "$name-gate" "$(printf '{"gate":%s,"afterSteps":%s,"outcome":%s,"reason":%s,"explain":%s}' "$(json_str "$name")" "$(json_str "$after")" "$(json_str "$outcome")" "$(json_str "$reason")" "$(json_str "$explains")")"
   GATE_REASONS=""
   if [ "$outcome" = closed ]; then
     bad "${C_B}$name-gate dicht${C_0}: $reason"
@@ -217,15 +229,19 @@ gate() { # name after_steps
   ok "${C_B}$name-gate open${C_0}${reason:+ ($reason)}"
 }
 
-explain_for() { # approved, not expired explain for this gate (explains.yaml: id, gate, rule, reason, approver, until)
-  local f="$R_REPO/explains.yaml" today
+explain_for() { # gate reason -> id of an approved, not expired explain whose rule is part of the reason
+  # explains.yaml entries: id, gate, rule, reason, approver, until (YYYY-MM-DD, inclusive)
+  local f="$R_REPO/explains.yaml"
   [ -f "$f" ] || return 0
-  today=$(date -u +%Y-%m-%d)
-  awk -v g="$1" -v t="$today" '
-    /^- id:/ {id=$3; gate=""; until=""; appr=""}
-    /^  gate:/ {gate=$2}
-    /^  approver:/ {appr=$2}
-    /^  until:/ {until=$2; if (gate==g && appr!="" && until>=t) {print id; exit}}' "$f"
+  awk -v g="$1" -v why="$2" -v t="$(date -u +%Y-%m-%d)" '
+    function val(line) { sub(/^[^:]*:[ ]*/, "", line); sub(/[ ]+#.*$/, "", line); gsub(/^"|"$/, "", line); return line }
+    function check() { if (id != "" && gate == g && rule != "" && appr != "" && until >= t && index(why, rule) > 0) { print id; found = 1; exit } }
+    /^- id:/ { check(); id = val($0); gate = ""; rule = ""; appr = ""; until = "" }
+    /^  gate:/ { gate = val($0) }
+    /^  rule:/ { rule = val($0) }
+    /^  approver:/ { appr = val($0) }
+    /^  until:/ { until = val($0) }
+    END { if (!found) check() }' "$f"
 }
 
 # -- generic step implementations; a repository can override each with ci_<name> in ci/steps.sh
