@@ -54,3 +54,21 @@ YAML
   [ -z "$(explain_for security 'image x: kritieke of hoge kwetsbaarheid')" ]
   [ -z "$(explain_for code 'versheid: x')" ]
 }
+
+@test "a gate keeps every reason, and an explain covers only its own" {
+  R_REPO=$(mktemp -d); R_DIR=$(mktemp -d)
+  printf -- '- id: EXP-001\n  gate: security\n  rule: "versheid"\n  approver: Johannes\n  until: 2999-12-31\n' >"$R_REPO/explains.yaml"
+  emit() { printf '%s\n' "$3" >"$R_DIR/gate.json"; }
+  finish_run() { :; }
+  GATE_REASONS="image x: kritieke of hoge kwetsbaarheid; versheid: een library loopt achter"
+  run gate security 6-7
+  [ "$status" -eq 1 ]
+  grep -q '"outcome":"closed"' "$R_DIR/gate.json"
+  grep -q 'kwetsbaarheid; afwijking EXP-001: versheid' "$R_DIR/gate.json"
+}
+
+@test "explain_json gives the details of an explain for the log line" {
+  R_REPO=$(mktemp -d)
+  printf -- '- id: EXP-001\n  gate: security\n  rule: "versheid"\n  reason: "Angular 21 -> 22"\n  approver: Johannes\n  until: 2026-12-31\n' >"$R_REPO/explains.yaml"
+  [ "$(explain_json EXP-001)" = '{"id":"EXP-001","gate":"security","rule":"versheid","reason":"Angular 21 -> 22","approver":"Johannes","until":"2026-12-31"}' ]
+}
