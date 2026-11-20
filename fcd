@@ -63,11 +63,11 @@ CFG=""
 cfg_load() { # showcase repository dir -> $CFG (a file)
   local dir=$1 out=$2
   ls "$dir"/fcd/*.fcd.yaml >/dev/null 2>&1 || die "$dir: geen declaratieve bestanden (fcd/*.fcd.yaml)"
-  local files=() f
-  for f in "$dir"/fcd/*.fcd.yaml; do files+=("/cfg/$(basename "$f")"); done
+  local cfg_files=() f
+  for f in "$dir"/fcd/*.fcd.yaml; do cfg_files+=("/cfg/$(basename "$f")"); done
   docker run --rm -v "$dir/fcd":/cfg:ro "$TOOL_YQ" ea \
     '. as $d | $d | .. | select(tag != "!!map" and tag != "!!seq") | ($d.kind + "/" + $d.metadata.name + "/" + (path | join("/"))) + "=" + (. | tostring)' \
-    "${files[@]}" >"$out" || die "configuratie van $dir niet te lezen"
+    "${cfg_files[@]}" >"$out" || die "configuratie van $dir niet te lezen"
   CFG=$out
 }
 cfg() { # kind name path [default]
@@ -454,7 +454,8 @@ step_build() { # build all images, tags follow versions.env; fetch the images th
 }
 
 ephemeral_up() {
-  compose_r "$R_EPHEMERAL" -f "$R_REPO/ci/compose.ephemeral.yml" up -d --no-build --remove-orphans
+  # A short-lived environment is never the deployed environment: what it measures (such as orders of tests) is werkplek.
+  FCD_ENVIRONMENT=werkplek compose_r "$R_EPHEMERAL" -f "$R_REPO/ci/compose.ephemeral.yml" up -d --no-build --remove-orphans
   wait_ready "$R_EPHEMERAL"
 }
 ephemeral_down() { [ -n "${CI_COMPOSE_FILES:-}" ] && compose_r "$R_EPHEMERAL" -f "$R_REPO/ci/compose.ephemeral.yml" down -v --remove-orphans >/dev/null 2>&1 || true; }
@@ -494,21 +495,21 @@ step_security_freshness() { # vulnerabilities, secrets, configuration; freshness
   vsev=$(cfg_list QualityGate security spec/thresholds/vulnerabilities/severities | paste -sd, -)
   msev=$(cfg_list QualityGate security spec/thresholds/misconfigurations/severities | paste -sd, -)
   [ "$(threshold security vulnerabilities/onlyWithFix true)" = true ] && fix=--ignore-unfixed
-  echo "== repository: vulnerabilities ($vsev), secrets"
-  trivy_r fs --exit-code 1 --severity "${vsev:-CRITICAL,HIGH}" --scanners vuln --offline-scan $fix \
-    --skip-dirs /repo/.fcd /repo || s_fail "repository: kwetsbaarheid ($vsev)"
-  trivy_r fs --exit-code 1 --scanners secret --skip-dirs /repo/.fcd /repo || [ "$(threshold security secrets/max 0)" != 0 ] \
-    || s_fail "repository: geheim gevonden"
+  # Trivy: exit code 3 = findings, anything else non-zero = the scan itself failed (both close the gate).
+  echo "== repository: vulnerabilities ($vsev)"
+  scan_r "repository: kwetsbaarheid ($vsev)" fs --exit-code 3 --severity "${vsev:-CRITICAL,HIGH}" --scanners vuln --offline-scan $fix --skip-dirs /repo/.fcd /repo
+  echo "== repository: secrets"
+  if [ "$(threshold security secrets/max 0)" = 0 ]; then
+    scan_r "repository: geheim gevonden" fs --exit-code 3 --scanners secret --offline-scan --skip-dirs /repo/.fcd /repo
+  fi
   echo "== repository: configuration ($msev)"
-  trivy_r fs --exit-code 1 --severity "${msev:-CRITICAL,HIGH}" --scanners misconfig --skip-dirs /repo/.fcd /repo \
-    || s_fail "repository: misconfiguratie ($msev)"
+  scan_r "repository: misconfiguratie ($msev)" fs --exit-code 3 --severity "${msev:-CRITICAL,HIGH}" --scanners misconfig --offline-scan --skip-dirs /repo/.fcd /repo
   if [ -n "${CI_COMPOSE_FILES:-}" ]; then
     local img
     for img in $(images); do
       echo "== image $img"
       docker save -o "$R_DIR/scan/image.tar" "$img"
-      trivy_r image --exit-code 1 --severity "${vsev:-CRITICAL,HIGH}" $fix --input /scan/image.tar \
-        || s_fail "image $img: kwetsbaarheid ($vsev)"
+      scan_r "image $img: kwetsbaarheid ($vsev)" image --exit-code 3 --severity "${vsev:-CRITICAL,HIGH}" $fix --input /scan/image.tar
       rm -f "$R_DIR/scan/image.tar"
     done
   fi
@@ -537,6 +538,16 @@ EOF_PARTS
   if [ "$rc" -ne 0 ]; then
     if [ "$undetermined" = closed ]; then s_fail "versheid niet te bepalen"; else s_warn "versheid niet te bepalen (netwerk?)"; fi
   fi
+}
+
+scan_r() { # reason trivy-args...: run a scan; findings (exit 3) or a failed scan close the gate, each with its own reason
+  local reason=$1 rc=0; shift
+  trivy_r "$@" || rc=$?
+  case $rc in
+    0) ;;
+    3) s_fail "$reason" ;;
+    *) s_fail "scan mislukt (${reason%%:*}), zie log" ;;
+  esac
 }
 
 trivy_r() {
@@ -619,9 +630,12 @@ step_release() { # git tag + GitHub Release with the text from CHANGELOG.md (con
   [ -s "$notes" ] || { s_fail "geen tekst voor $R_VERSION in CHANGELOG.md"; return 0; }
   git -C "$R_REPO" tag -a "$tag" -m "$R_SUBPRODUCT $R_VERSION" "$R_SHA"
   git -C "$R_REPO" push origin "$tag"
+  local repo_url; repo_url=$(git -C "$R_REPO" remote get-url origin)
   if [ "$(cfg Pipeline "$R_PIPELINE" spec/release/githubRelease true)" != true ]; then echo "no GitHub Release (configuration)"
+  elif ! printf '%s' "$repo_url" | grep -qE '^(https://github\.com/|git@github\.com:)'; then
+    # Every git host works (exit strategy): without GitHub only the tag, the notes stay in CHANGELOG.md.
+    s_warn "origin is geen GitHub-repository: alleen de git-tag $tag, geen GitHub Release"
   elif command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
-    local repo_url; repo_url=$(git -C "$R_REPO" remote get-url origin)
     gh release create "$tag" --repo "$repo_url" --title "$R_SUBPRODUCT $R_VERSION" --notes-file "$notes" --verify-tag
   else
     s_warn "gh ontbreekt: alleen de git-tag, geen GitHub Release"

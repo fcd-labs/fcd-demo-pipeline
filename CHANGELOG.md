@@ -17,6 +17,12 @@ Alle wijzigingen per versie. Formaat: [Keep a Changelog](https://keepachangelog.
 - `fcd up --showcase <dir>`: het Dashboard en de Pipeline-agent van de showcase, in de vastgelegde versies (git-tags, lokaal gebouwd).
 - De agent volgt ook de showcase-repository: een wijziging in de configuratie haalt de deelproducten opnieuw door de pipeline.
 - `fcd report` bewaart ook de log van het experiment (`log/<experiment>.jsonl`) in de showcase-repository.
+- `FCD_REPO_BASE`: een andere plek voor de repositories (een fork of een proef).
+
+### Opgelost
+- Een tijdelijke testomgeving in een run na een merge meldde zich als `lokaal`; de bestellingen van de integratietests telden dan mee voor het key result. Nu altijd `werkplek`.
+- Releasen naar een git-host die geen GitHub is: alleen de tag (elke git-host werkt), geen fout.
+- Scans: een bevinding (exitcode 3) en een mislukte scan (zoals een geblokkeerde download) hebben elk een eigen reden; beide houden de gate dicht.
 
 ## [0.3.3] - 2026-11-20
 
