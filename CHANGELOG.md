@@ -4,6 +4,12 @@ Alle wijzigingen per versie. Formaat: [Keep a Changelog](https://keepachangelog.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-21
+
+### Toegevoegd
+- De webinterface van het API-register (Apicurio Registry UI, Apache-2.0) draait mee, op de poort `registry-ui` uit de configuratie (Demo: 8072). Het register laat alleen die webinterface toe (CORS).
+- Elk contract staat in het register met zijn titel uit de configuratie en labels (showcase, repository, deelproduct, type, compatibiliteit), zodat je bijvoorbeeld zoekt op `deelproduct:bestellen`. De groep (de showcase) krijgt een beschrijving.
+
 ## [0.5.1] - 2026-11-21
 
 ### Opgelost

@@ -452,6 +452,17 @@ contract_content() { # name dir file type -> {"content": ..., "contentType": ...
   done
   printf '{"content":%s,"contentType":"%s","references":[%s]}' "$(json_str "$(cat "$dir/$file")")" "$ct" "$refs"
 }
+registry_meta() { # name -> artifact metadata from the configuration: title, description and labels (findable in the register)
+  local name=$1 title repo sp s
+  title=$(cfg Contract "$name" metadata/title "$name"); repo=$(cfg Contract "$name" spec/repository)
+  sp=$repo
+  for s in $(cfg_names SubProduct); do [ "$(cfg SubProduct "$s" spec/repository)" = "$repo" ] && sp=$s; done
+  printf '{"name":%s,"description":%s,"labels":{"showcase":%s,"repository":%s,"deelproduct":%s,"type":%s,"compatibility":%s}}' \
+    "$(json_str "$title")" "$(json_str "$title ($repo, $(cfg Contract "$name" spec/file))")" "$(json_str "$SC_NAME")" "$(json_str "$repo")" \
+    "$(json_str "$sp")" "$(json_str "$(cfg Contract "$name" spec/type OPENAPI)")" "$(json_str "$(cfg Contract "$name" spec/compatibility BACKWARD)")"
+}
+registry_set_meta() { [ "$(registry_call PUT "/artifacts/$1" "$(registry_meta "$1")" | cut -d' ' -f1)" = 204 ]; }
+
 registry_has() { [ "$(registry_call GET "/artifacts/$1/versions/$2" | cut -d' ' -f1)" = 200 ]; }
 registry_add() { # name version dir file type dry -> prints "status body"; creates the artifact (with its rules) when it is new
   local name=$1 ver=$2 dir=$3 file=$4 type=$5 dry=${6:-} content r
@@ -459,6 +470,7 @@ registry_add() { # name version dir file type dry -> prints "status body"; creat
   if [ "$(registry_call GET "/artifacts/$name" | cut -d' ' -f1)" != 200 ]; then
     [ -n "$dry" ] && { printf '200 new contract'; return; }
     r=$(registry_call POST /artifacts "$(printf '{"artifactId":"%s","artifactType":"%s","firstVersion":{"version":"%s","content":%s}}' "$name" "$type" "$ver" "$content")")
+    registry_set_meta "$name" || true
     registry_call POST "/artifacts/$name/rules" "$(printf '{"ruleType":"COMPATIBILITY","config":"%s"}' "$(cfg Contract "$name" spec/compatibility BACKWARD)")" >/dev/null
     # SYNTAX_ONLY: FULL cannot follow a $ref to a separate schema file (such as logline.openapi.yaml -> logline.schema.json).
     registry_call POST "/artifacts/$name/rules" '{"ruleType":"VALIDITY","config":"SYNTAX_ONLY"}' >/dev/null
@@ -941,10 +953,12 @@ dashboard_up() { # the Dashboard of the showcase: pinned version, own store, own
 
 registry_start() { # the API-register of the showcase (Apicurio Registry, tool of FCD)
   [ -n "${PORT_REGISTRY:-}" ] || { info "geen poort voor het API-register in de configuratie"; return 0; }
-  TOOL_APICURIO="$TOOL_APICURIO" docker compose -p "$SC_PREFIX-registry" -f "$FCD_PIPELINE_DIR/tools/registry.compose.yml" up -d >/dev/null 2>&1 \
-    || die "API-register start niet"
+  [ -n "${PORT_REGISTRY_UI:-}" ] || export PORT_REGISTRY_UI=$((PORT_REGISTRY + 1))
+  TOOL_APICURIO="$TOOL_APICURIO" TOOL_APICURIO_UI="$TOOL_APICURIO_UI" \
+    docker compose -p "$SC_PREFIX-registry" -f "$FCD_PIPELINE_DIR/tools/registry.compose.yml" up -d >"$SC_HOME/registry-up.log" 2>&1 \
+    || { tail -5 "$SC_HOME/registry-up.log"; die "API-register start niet"; }
   local i; for i in $(seq 1 60); do registry_up_ok && break; sleep 2; done
-  registry_up_ok && ok "API-register (Apicurio Registry, in het geheugen): http://127.0.0.1:$PORT_REGISTRY" || { bad "API-register reageert niet"; return 0; }
+  registry_up_ok && ok "API-register (Apicurio Registry, in het geheugen): http://127.0.0.1:$PORT_REGISTRY_UI (API op $PORT_REGISTRY)" || { bad "API-register reageert niet"; return 0; }
   registry_seed
 }
 
@@ -969,7 +983,11 @@ registry_seed() { # fill the register from git: every contract of the configurat
       fi
     fi
     rm -rf "$tmp"
+    # Title and labels from the configuration, also for contracts that were already there.
+    [ "$(registry_call GET "/artifacts/$c" | cut -d' ' -f1)" = 200 ] && registry_set_meta "$c"
   done
+  # The group is the showcase (it exists once a contract is registered).
+  registry_call PUT "" "$(printf '{"description":%s,"labels":{"showcase":%s}}' "$(json_str "Contracten van showcase $SC_NAME (configuratie: $(basename "$SC_REPO")/fcd)")" "$(json_str "$SC_NAME")")" >/dev/null
   ok "API-register gevuld uit git ($n nieuwe contractversies)"
 }
 
