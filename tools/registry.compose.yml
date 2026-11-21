@@ -1,5 +1,6 @@
 # API-register of a showcase: Apicurio Registry (Apache-2.0), a tool of FCD without own code.
-# Started by `fcd up` as project <prefix>-registry; the port comes from the configuration (Environment.ports.registry).
+# Started by `fcd up` as project <prefix>-registry; the ports come from the configuration
+# (Environment.ports.registry and registry-ui).
 # Storage in memory (H2) for the demo: afwijking EXP-003. The contracts are in git; the Pipeline fills the register again.
 services:
   registry:
@@ -12,5 +13,24 @@ services:
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
+    environment:
+      # Only the web interface of this showcase may call the API from a browser.
+      QUARKUS_HTTP_CORS_ORIGINS: http://127.0.0.1:${PORT_REGISTRY_UI:?run via fcd (environment of the showcase)},http://localhost:${PORT_REGISTRY_UI}
     ports:
       - "127.0.0.1:${PORT_REGISTRY:?run via fcd (environment of the showcase)}:8080"
+
+  registry-ui:
+    image: ${TOOL_APICURIO_UI:?run via fcd (tools.env)}
+    # Not read-only: the web interface writes its configuration (the API address) at start.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    environment:
+      # Called by the browser, so the address on this machine.
+      REGISTRY_API_URL: http://127.0.0.1:${PORT_REGISTRY}/apis/registry/v3
+    ports:
+      - "127.0.0.1:${PORT_REGISTRY_UI}:8080"
+    depends_on:
+      - registry
